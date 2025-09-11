@@ -26,7 +26,7 @@ bool IR_values[5] = {false, false, false, false, false};
 //Threshold value used to determine a detection on the IR sensors.
 //Reduce the value for a earlier detection, increase it if there
 //false detections.
-int threshold = 50;
+int threshold[5] = {70, 70, 50, 70, 70};
 //State Machine Variable
 // 0 -move forward , 1 - forward obstacle , 2 - right proximity , 3 - left proximity
 int state=0, old_state=0;
@@ -242,17 +242,17 @@ void avoid_moving(){
     else if(state == 1){
       //Spin to the left (전방 장애물 회피)
       Motors_spin_left(100);
-      turn_until = now + 150;  
+      turn_until = now + 0;  
     }
     else if(state == 2){
       //Spin to the left (우측 근접 회피)
       Motors_spin_left(100);
-      turn_until = now + 150;
+      turn_until = now + 0;
     }
     else if(state == 3){
       //Spin to the right (좌측 근접 회피)
       Motors_spin_right(100);
-      turn_until = now + 150;
+      turn_until = now + 0;
     }
   }
 }
@@ -260,12 +260,12 @@ void avoid_moving(){
 void read_IR_sensor(){
   //--------------IR sensors------------------------
   //Decide future state:
-	//Read IR values to determine maze walls
-  IR_values[0] = Detect_object(1,threshold);
-  IR_values[1] = Detect_object(2,threshold);
-  IR_values[2] = Detect_object(3,threshold);
-  IR_values[3] = Detect_object(4,threshold);
-  IR_values[4] = Detect_object(5,threshold);
+  //Read IR values to determine maze walls
+  IR_values[0] = Detect_object(1,threshold[0]);
+  IR_values[1] = Detect_object(2,threshold[1]);
+  IR_values[2] = Detect_object(3,threshold[2]);
+  IR_values[3] = Detect_object(4,threshold[3]);
+  IR_values[4] = Detect_object(5,threshold[4]);
 }
 
 void update_state(){
@@ -285,5 +285,5 @@ void update_state(){
 		state=0;
 	}
 
-	//delay(5);
+  //delay(5);
 }
