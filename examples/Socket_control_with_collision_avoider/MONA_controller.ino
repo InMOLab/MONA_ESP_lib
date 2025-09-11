@@ -45,11 +45,17 @@ unsigned long lastClientRX = 0;
 
 // NonBlocking 명령 실행 상태 
 char active_cmd = 0;                 // 현재 실행 중 명령('F','B','L','R')
-int  cmd_speed = 0;                  // 현재 속도
 unsigned long cmd_deadline_ms = 0;   // 명령 종료 시각
+
+// 사용자 지정 파라미터
 const unsigned long CMD_FWD_MS  = 1000;  // 필요 시 조정
 const unsigned long CMD_BACK_MS = 1000;
 const unsigned long CMD_TURN_MS = 500;
+
+const int  CMD_SPEED = 150;   // Motor Speed 조절
+
+const int SPEED_AVOID_LEFT  = 100; // 회피 Motor speed 조절
+const int SPEED_AVOID_RIGHT = 100;
 
 // 함수 선언
 void read_IR_sensor();
@@ -107,7 +113,6 @@ void setup() {
 
   // 초기 명령 상태 리셋
   active_cmd = 0;
-  cmd_speed = 0;
   cmd_deadline_ms = 0;
 }
 
@@ -155,27 +160,23 @@ void loop() {
 void socket_control(char c) {
   if(c=='F'){
     active_cmd = 'F';
-    cmd_speed = 150;
     cmd_deadline_ms = millis() + CMD_FWD_MS;
-    Motors_forward(cmd_speed);
+    Motors_forward(CMD_SPEED);
   }
   else if(c=='B'){
     active_cmd = 'B';
-    cmd_speed = 150;
     cmd_deadline_ms = millis() + CMD_BACK_MS;
-    Motors_backward(cmd_speed);
+    Motors_backward(CMD_SPEED);
   }
   else if(c=='R'){
     active_cmd = 'R';
-    cmd_speed = 150;
     cmd_deadline_ms = millis() + CMD_TURN_MS;
-    Motors_spin_right(cmd_speed);
+    Motors_spin_right(CMD_SPEED);
   }
   else if(c=='L'){
     active_cmd = 'L';
-    cmd_speed = 150;
     cmd_deadline_ms = millis() + CMD_TURN_MS;
-    Motors_spin_left(cmd_speed);
+    Motors_spin_left(CMD_SPEED);
   }
   else {
     safe_stop();
@@ -194,7 +195,6 @@ void run_active_cmd_tick() {
 void safe_stop() {
   Motors_stop();
   active_cmd = 0;
-  cmd_speed = 0;
   cmd_deadline_ms = 0;
 }
 
@@ -235,23 +235,23 @@ void avoid_moving(){
   if (now >= turn_until) {
     if(state == 0){
       // Start moving Forward -> 원래 정지였지만, 정면 감지시 좌회전 유지로 바꾸었습니다.
-      Motors_spin_left(100);
-      turn_until = now + 150;   // 짧게 유지(비블로킹)
+      Motors_spin_left(SPEED_AVOID_LEFT);
+      turn_until = now + 0;   // 짧게 유지(비블로킹)
       return;
     }
     else if(state == 1){
       //Spin to the left (전방 장애물 회피)
-      Motors_spin_left(100);
+      Motors_spin_left(SPEED_AVOID_LEFT);
       turn_until = now + 0;  
     }
     else if(state == 2){
       //Spin to the left (우측 근접 회피)
-      Motors_spin_left(100);
+      Motors_spin_left(SPEED_AVOID_LEFT);
       turn_until = now + 0;
     }
     else if(state == 3){
       //Spin to the right (좌측 근접 회피)
-      Motors_spin_right(100);
+      Motors_spin_right(SPEED_AVOID_RIGHT);
       turn_until = now + 0;
     }
   }
