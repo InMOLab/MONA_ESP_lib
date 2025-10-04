@@ -61,7 +61,7 @@ const int SPEED_AVOID_RIGHT = 100;
 void read_IR_sensor();
 void update_state();
 void avoid_moving();
-void socket_read_nonblocking();
+void socket_read_reconnection();
 void socket_control(char c);
 void run_active_cmd_tick();          
 void safe_stop();
@@ -118,7 +118,7 @@ void setup() {
 
 void loop() {
   // TCP 세션 유지 위해 keyboard 명령어 항상 읽기 수행 (회피 중에도 수행함)
-  socket_read_nonblocking();
+  socket_read_reconnection();
 
   // 센서/상태 갱신
   read_IR_sensor();
@@ -139,7 +139,7 @@ void loop() {
     if (was_obs) {
       Motors_stop();
     }
-    // 장애물 X : 저장된 키를 실행 (socket_read_nonblocking에서 저장된 값)
+    // 장애물 X : 저장된 키를 실행 (socket_read_reconnection에서 저장된 값)
     if (pendingCmd) {
       socket_control(pendingCmd);  // 시작만 수행(지속/종료는 틱에서)
       pendingCmd = 0;   // 소진
@@ -199,7 +199,7 @@ void safe_stop() {
 }
 
 // 소켓 읽기만 수행 -> 통신 연결 유지
-void socket_read_nonblocking() {
+void socket_read_reconnection() {
   // 연결 미존재 or 끊겼으면 통신 accept
   if (!activeClient or !activeClient.connected()) {
     activeClient = wifiServer.available();
