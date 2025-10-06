@@ -62,8 +62,7 @@ void read_IR_sensor();
 void update_state();
 void avoid_moving();
 void socket_read_reconnection();
-void socket_control(char c);
-void run_active_cmd_tick();          
+void socket_control(char c);        
 void safe_stop();
 
 void setup() {
@@ -144,8 +143,6 @@ void loop() {
       socket_control(pendingCmd);  // 시작만 수행(지속/종료는 틱에서)
       pendingCmd = 0;   // 소진
     }
-    // 실행 중 명령 틱 유지/종료
-    run_active_cmd_tick();
   }
 
   // 입력 시간이 지났을 경우의 안전정지(네트워크 끊김 대비)
@@ -179,14 +176,6 @@ void socket_control(char c) {
     Motors_spin_left(CMD_SPEED);
   }
   else {
-    safe_stop();
-  }
-}
-
-// 명령 지속/종료 틱 처리 및 실행 중 명령 틱 유지/종료(비블로킹)
-void run_active_cmd_tick() {
-  if (!active_cmd) return;
-  if (millis() > cmd_deadline_ms) {
     safe_stop();
   }
 }
