@@ -23,6 +23,10 @@
 
 //Variables
 bool IR_values[5] = {false, false, false, false, false};
+
+// IR 센서 측정값 => r1–r3 비교 및 회피 / 회피연속시 긴급회피에 사용
+int IR_raw[5] = {0, 0, 0, 0, 0};
+
 //Threshold value used to determine a detection on the IR sensors.
 //Reduce the value for a earlier detection, increase it if there
 //false detections.
@@ -57,6 +61,20 @@ const int  CMD_SPEED = 150;   // Motor Speed 조절
 const int SPEED_AVOID_LEFT  = 100; // 회피 Motor speed 조절
 const int SPEED_AVOID_RIGHT = 100;
 
+// r1–r3 비교 회피의 차이값 DELTA & 회피 연속시 비상 회피 파라미터
+const int DELTA = 15;                               // r1–r3 차이값 파라미터
+const unsigned long OSCILLATION_WINDOW_MS = 1200;   // 좌↔우 전환 감지 기준: 1.2초
+const int OSCILLATION_COUNT_THRESHOLD = 4;          // 전환 횟수 임계값
+const unsigned long EMERGENCY_SPIN_MS = 400;        // 비상 좌회전 MS값
+const unsigned long BACK_MS = 120;                  // 비상 후진 MS값
+
+// 회피 연속시 비상 회피 상태 변수
+bool emergency_active = false;
+unsigned long emergency_until = 0;
+int last_turn_direction = 0;        // -1=좌, +1=우, 0=없음
+int turn_change_count = 0;
+unsigned long oscillation_timer_start = 0;
+
 // 함수 선언
 void read_IR_sensor();
 void update_state();
@@ -64,6 +82,8 @@ void avoid_moving();
 void socket_read_reconnection();
 void socket_control(char c);        
 void safe_stop();
+void check_oscillation_and_escape(int current_direction);
+void start_emergency_left_spin();
 
 void setup() {
   //Initialize the MonaV2 robot
@@ -137,6 +157,10 @@ void loop() {
     // 회피 이후 1회 정지
     if (was_obs) {
       Motors_stop();
+      // 회피 종료 시 회피 연속 감지를 위한 횟수 초기화
+      last_turn_direction = 0;
+      turn_change_count = 0;
+      oscillation_timer_start = 0;
     }
     // 장애물 X : 저장된 키를 실행 (socket_read_reconnection에서 저장된 값)
     if (pendingCmd) {
@@ -221,6 +245,16 @@ void avoid_moving(){
   static unsigned long turn_until = 0;
   unsigned long now = millis();
 
+  //회피 연속시 비상 좌회전 로직 : 시간 끝날 때까지 강제 좌회전
+  if (emergency_active) {
+    if (now < emergency_until) {
+      Motors_spin_left(SPEED_AVOID_LEFT);
+      return;
+    } else {
+      emergency_active = false; // 커밋 종료 → 일반 회피 로직으로
+    }
+  }
+
   if (now >= turn_until) {
     if(state == 0){
       // Start moving Forward -> 원래 정지였지만, 정면 감지시 좌회전 유지로 바꾸었습니다.
@@ -229,18 +263,33 @@ void avoid_moving(){
       return;
     }
     else if(state == 1){
-      //Spin to the left (전방 장애물 회피)
-      Motors_spin_left(SPEED_AVOID_LEFT);
+      // 전방 장애물 존재시 회전 방향 결정: r1(센서2)·r3(센서4) 비교로 좌/우 선택 + 과회피 감지
+      int r1 = IR_raw[1];  // 좌전방
+      int r3 = IR_raw[3];  // 우전방
+      int diff = abs(r1 - r3);
+
+      if (diff <= DELTA) {
+        Motors_spin_left(SPEED_AVOID_LEFT);
+        check_oscillation_and_escape(-1);
+      } else if (r1 < r3) {
+        Motors_spin_left(SPEED_AVOID_LEFT);     // 왼쪽이 더 여유 → 좌
+        check_oscillation_and_escape(-1);
+      } else {
+        Motors_spin_right(SPEED_AVOID_RIGHT);   // 오른쪽이 더 여유 → 우
+        check_oscillation_and_escape(+1);
+      }
       turn_until = now + 0;  
     }
     else if(state == 2){
       //Spin to the left (우측 근접 회피)
       Motors_spin_left(SPEED_AVOID_LEFT);
+      check_oscillation_and_escape(-1);         // 과회피 감지 호출
       turn_until = now + 0;
     }
     else if(state == 3){
       //Spin to the right (좌측 근접 회피)
       Motors_spin_right(SPEED_AVOID_RIGHT);
+      check_oscillation_and_escape(+1);         // 과회피 진동 감지 호출
       turn_until = now + 0;
     }
   }
@@ -250,6 +299,14 @@ void read_IR_sensor(){
   //--------------IR sensors------------------------
   //Decide future state:
   //Read IR values to determine maze walls
+
+  // IR센서 감지값 위한 각각 센서값 저장
+  IR_raw[0] = Get_IR(1);
+  IR_raw[1] = Get_IR(2);
+  IR_raw[2] = Get_IR(3);
+  IR_raw[3] = Get_IR(4);
+  IR_raw[4] = Get_IR(5);
+
   IR_values[0] = Detect_object(1,threshold[0]);
   IR_values[1] = Detect_object(2,threshold[1]);
   IR_values[2] = Detect_object(3,threshold[2]);
@@ -275,4 +332,40 @@ void update_state(){
 	}
 
   //delay(5);
+}
+
+// 과회피 감지: 빠른 방향 전환 + 누적 시 비상 좌회전 로직 진입
+void check_oscillation_and_escape(int current_direction) {
+  if (current_direction == 0) return;
+
+  unsigned long now = millis();
+  if (last_turn_direction != 0 && current_direction != last_turn_direction) {
+    if (now - oscillation_timer_start > OSCILLATION_WINDOW_MS) {
+      turn_change_count = 1;
+      oscillation_timer_start = now;
+    } else {
+      turn_change_count++;
+    }
+    if (turn_change_count >= OSCILLATION_COUNT_THRESHOLD) {
+      Serial.println("\n*** OSCILLATION DETECTED! -> EMERGENCY ESCAPE (LEFT) ***\n");
+      start_emergency_left_spin();
+      return;
+    }
+  } else if (last_turn_direction == 0) {
+    oscillation_timer_start = now;
+    turn_change_count = 0;
+  }
+  last_turn_direction = current_direction;
+}
+
+// 비상 좌회전 로직: 즉시 정지→후진→좌회전 일정 시간 유지
+void start_emergency_left_spin() {
+  safe_stop();
+  Motors_backward(CMD_SPEED);
+  delay(BACK_MS);
+  Motors_spin_left(CMD_SPEED);
+  emergency_active = true;
+  emergency_until = millis() + EMERGENCY_SPIN_MS;
+  turn_change_count = 0;
+  last_turn_direction = -1;
 }
