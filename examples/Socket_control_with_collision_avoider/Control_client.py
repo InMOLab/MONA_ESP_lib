@@ -2,6 +2,7 @@
 #
 #Created by Bart Garcia, January 2021.
 #bart.garcia.nathan@gmail.com
+
 import socket
 import curses
 
@@ -43,11 +44,6 @@ try:
             screen.addstr(3, 0, 'Down arrow -> Move Backward   ')
             sock.send(b"B")
 finally:
-
-    try:
-        sock.send(b"S")  # 안전 정지
-    except:
-        pass
     # shut down cleanly
     curses.nocbreak(); screen.keypad(False); curses.echo()
     curses.endwin()
