@@ -1,2 +1,2 @@
-from mona_udp_controller import main
+from mona_puppet import main
 main()
