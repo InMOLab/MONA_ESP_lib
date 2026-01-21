@@ -1,27 +1,35 @@
+#include <cmath>
+#include <set>
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include "Mona_ESP_lib.h"
-#include <math.h>
-#include <strings.h>
 #include <Arduino.h>
-#include <WiFiClient.h>
-#include <WiFiServer.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include <ArduinoJson.h>
 #include <vector>
 #include <map>
 #include <algorithm>
-#include <freertos/FreeRTOS.h>
-#include <freertos/semphr.h>
-#include <freertos/task.h>
+
+// Behavior Tree library
+#include "bt_nodes.h"
+
+// CBBA library (ported from cbba.py)
+#include "cbba.h"
 
 // ====== USER CONFIG ======
 const char* SSID       = "Your SSID";
 const char* PASSWORD   = "Your Password";
-const String SELF_ID   = "11";           // Change this for each robot (0-11)
-const uint16_t TCP_PORT = 8080;
-const uint16_t UDP_PORT = 8080;
+const int   SELF_ID    = 0;           // Change this for each robot (0-11)
+const uint16_t UDP_PORT = 9000;
+
+// PC Status Report Configuration
+const char* PC_HOST = "192.168.0.17";  // PC IP address
+const int PC_STATUS_PORT = 9001;       // Port for MONA → PC status reports
+const unsigned long STATUS_REPORT_INTERVAL_MS = 200;  // Report every 200ms
+
+// CBBA Configuration (matching cbba.py config)
+CBBAConfig cbba_config;
 
 // JSON buffer size
 const size_t JSON_SIZE = 2048;
@@ -39,8 +47,8 @@ RobotState state = STATE_IDLE;
 
 // ESP-NOW settings
 const int TOTAL_ROBOTS = 12;
-const uint32_t MIN_BROADCAST_MS = 50;
-const uint32_t MAX_BROADCAST_MS = 100;
+const uint32_t MIN_BROADCAST_MS = 100; //통신 안정화를 위해 변경
+const uint32_t MAX_BROADCAST_MS = 200;
 const uint32_t PEER_LINK_DROP_MS = 900;
 const uint32_t WIFI_RECONNECT_INTERVAL_MS = 300;
 const uint32_t WIFI_TIMEOUT_MS = 10000;
@@ -73,11 +81,6 @@ static const int PIN_ENCODER_RIGHT = 39;
 
 // 제어 관련 임계값
 static const float ROTATION_DEADBAND_DEG = 5.0f;    // 미세 회전 무시 각도
-static const int   MIN_MOTOR_PWM         = 60;      // 모터 구동 최소 출력
-
-// PI 제어 게인 (주행 보정)
-static const float K_P = 0.95f;  // 비례 게인
-static const float K_I = 0.01f;  // 적분 게인
 
 // 비상 동작 속도
 static const int EMERGENCY_SPIN_SPD = 200;
@@ -98,16 +101,23 @@ unsigned long emergency_back_until = 0;
 unsigned long emergency_spin_until = 0;
 
 // ===== Network (Core 0) =====
-WiFiServer tcpServer(TCP_PORT);
 WiFiUDP udp;
-std::vector<WiFiClient> tcpClients;
+
+// CBBA Message Codec constants
+const float BID_SCALE_FACTOR = 100000.0f;
+const unsigned long TIMESTAMP_OFFSET = 0UL;
+
+// Received ESP-NOW messages storage
+struct ReceivedMessage {
+  StaticJsonDocument<1024> msg;
+  unsigned long timestamp;
+};
+std::map<int, ReceivedMessage> receivedMessages_MAP;
 
 // ===== CBBA Communication (Core 0) =====
-DynamicJsonDocument selfMessageDoc(JSON_SIZE);
-std::map<String, String> receivedJSON_MAP;
-std::map<String, unsigned long> CommRecvTime_MAP;
-SemaphoreHandle_t mapLock;
-SemaphoreHandle_t selfMsgLock;  // NEW: selfMessageDoc 보호
+StaticJsonDocument<JSON_SIZE> selfMessageDoc;
+StaticJsonDocument<JSON_SIZE> messageToShare;
+bool hasMessageToShare = false;
 
 unsigned long lastBroadcast = 0;
 volatile bool dirtySelf = false;
@@ -122,10 +132,14 @@ static char g_jsonBuf[JSON_SIZE];
 static uint8_t g_pkt[ESPNOW_MAX_PAYLOAD];
 
 // ===== Motion Control (Core 1) - Atomic variables for cross-core sharing =====
-volatile float targetAngleDeg = 0;
-volatile float targetDistMm = 0;
-volatile bool newMotionCommand = false;  // Core 0 → Core 1 signal
-volatile bool stopRequested = false;
+volatile float targetX = 0;
+volatile float targetY = 0;
+volatile bool hasTargetPosition = false;
+
+// Position from PC
+volatile float positionX = 0;
+volatile float positionY = 0;
+volatile float heading = 0;
 
 volatile long left_encoder_count  = 0;
 volatile long right_encoder_count = 0;
@@ -138,9 +152,7 @@ static long  start_left_count  = 0;
 static long  start_right_count = 0;
 static long  target_turn_pulses = 0;
 static long  target_move_pulses = 0;
-static float integral_error = 0.0f;
 
-TaskHandle_t commTaskHandle = NULL;
 TaskHandle_t motionTaskHandle = NULL;
 
 static inline void clear_motion_targets() {
@@ -148,7 +160,6 @@ static inline void clear_motion_targets() {
   target_move_pulses = 0;
   start_left_count  = left_encoder_count;
   start_right_count = right_encoder_count;
-  integral_error = 0.0f;
 }
 
 static inline void enter_escaping(uint16_t ms = ESCAPING_MS) {
@@ -191,51 +202,207 @@ static inline void check_oscillation_and_escape(int current_direction) {
 }
 
 // =============================================================================
+// TASK MANAGER - Manages tasks received from PC
+// =============================================================================
+class TaskManager {
+public:
+    TaskManager() : _last_update_ms(0) {}
+
+    void update_from_message(const std::vector<std::vector<float>>& task_list) {
+        std::set<int> received_ids;
+
+        for (const auto& task_data : task_list) {
+            if (task_data.size() < 4) continue;
+
+            int task_id = (int)task_data[0];
+            float x = task_data[1];
+            float y = task_data[2];
+            float amount = task_data[3];
+
+            received_ids.insert(task_id);
+
+            auto it = _tasks.find(task_id);
+            if (it != _tasks.end()) {
+                it->second.x = x;
+                it->second.y = y;
+                it->second.amount = amount;
+                it->second.completed = (amount <= 0);
+            } else {
+                _tasks[task_id] = CBBATask(task_id, x, y, amount);
+            }
+        }
+
+        for (auto& pair : _tasks) {
+            if (received_ids.find(pair.first) == received_ids.end()) {
+                pair.second.completed = true;
+            }
+        }
+
+        auto it = _tasks.begin();
+        while (it != _tasks.end()) {
+            if (it->second.completed) {
+                it = _tasks.erase(it);
+            } else {
+                ++it;
+            }
+        }
+
+        _last_update_ms = millis();
+    }
+
+    CBBATask* get_task(int task_id) {
+        auto it = _tasks.find(task_id);
+        return (it != _tasks.end()) ? &(it->second) : nullptr;
+    }
+
+    std::vector<CBBATask> get_all_tasks() {
+        std::vector<CBBATask> result;
+        for (auto& pair : _tasks) {
+            if (!pair.second.completed) {
+                result.push_back(pair.second);
+            }
+        }
+        return result;
+    }
+    
+    std::vector<Task*> get_all_tasks_ptr() {
+        _task_ptrs.clear();
+        for (auto& pair : _tasks) {
+            if (!pair.second.completed) {
+                _task_ptrs.push_back(reinterpret_cast<Task*>(&pair.second));
+            }
+        }
+        return _task_ptrs;
+    }
+
+    int get_task_count() const {
+        int count = 0;
+        for (const auto& pair : _tasks) {
+            if (!pair.second.completed) count++;
+        }
+        return count;
+    }
+
+    bool is_task_valid(int task_id) const {
+        auto it = _tasks.find(task_id);
+        return (it != _tasks.end() && !it->second.completed);
+    }
+
+    void clear() { _tasks.clear(); }
+
+private:
+    std::map<int, CBBATask> _tasks;
+    std::vector<Task*> _task_ptrs;
+    unsigned long _last_update_ms;
+};
+
+TaskManager* taskManager = nullptr;
+
+// =============================================================================
+// MESSAGE CODEC - Encodes/Decodes CBBA messages for ESP-NOW
+// =============================================================================
+class MessageCodec {
+public:
+    static bool encode(int agent_id, const JsonDocument& message, JsonDocument& output) {
+        output.clear();
+        if (message.isNull()) return false;
+        output["id"] = agent_id;
+        JsonObject y_out = output.createNestedObject("y");
+        if (message.containsKey("winning_bids")) {
+            JsonObjectConst bids = message["winning_bids"].as<JsonObjectConst>();
+            for (JsonPairConst kv : bids) {
+                float bid = kv.value().as<float>();
+                int task_id = atoi(kv.key().c_str());
+                y_out[String(task_id)] = (long)(bid * BID_SCALE_FACTOR);
+            }
+        }
+        JsonObject z_out = output.createNestedObject("z");
+        if (message.containsKey("winning_agents")) {
+            JsonObjectConst agents = message["winning_agents"].as<JsonObjectConst>();
+            for (JsonPairConst kv : agents) {
+                int winner = kv.value().as<int>();
+                int task_id = atoi(kv.key().c_str());
+                z_out[String(task_id)] = winner;
+            }
+        }
+        JsonObject s_out = output.createNestedObject("s");
+        if (message.containsKey("message_received_time_stamp")) {
+            JsonObjectConst timestamps = message["message_received_time_stamp"].as<JsonObjectConst>();
+            for (JsonPairConst kv : timestamps) {
+                unsigned long ts = kv.value().as<unsigned long>();
+                int ag_id = atoi(kv.key().c_str());
+                s_out[String(ag_id)] = (long)(ts - TIMESTAMP_OFFSET);
+            }
+        }
+        return true;
+    }
+
+    static bool decode(const JsonDocument& payload, JsonDocument& output) {
+        output.clear();
+        if (!payload.containsKey("y")) return false;
+        output["agent_id"] = payload["id"].as<int>();
+        JsonObject bids_out = output.createNestedObject("winning_bids");
+        if (payload.containsKey("y")) {
+            JsonObjectConst y = payload["y"].as<JsonObjectConst>();
+            for (JsonPairConst kv : y) {
+                long val = kv.value().as<long>();
+                bids_out[kv.key()] = (float)val / BID_SCALE_FACTOR;
+            }
+        }
+        JsonObject agents_out = output.createNestedObject("winning_agents");
+        if (payload.containsKey("z")) {
+            JsonObjectConst z = payload["z"].as<JsonObjectConst>();
+            for (JsonPairConst kv : z) {
+                int winner = kv.value().as<int>();
+                agents_out[kv.key()] = winner;
+            }
+        }
+        JsonObject ts_out = output.createNestedObject("message_received_time_stamp");
+        if (payload.containsKey("s")) {
+            JsonObjectConst s = payload["s"].as<JsonObjectConst>();
+            for (JsonPairConst kv : s) {
+                long ts = kv.value().as<long>();
+                ts_out[kv.key()] = (unsigned long)(ts + TIMESTAMP_OFFSET);
+            }
+        }
+        return true;
+    }
+};
+
+// =============================================================================
 // ESP-NOW COMMUNICATION (Core 0)
 // =============================================================================
-bool update_Broadcast_recv_JSON_MAP(const String& senderID, const char* jsonBuf, size_t jsonLen) {
-  if (jsonLen < 2) return false;
+void handleEspNowMessage(const uint8_t* data, int len) {
+  if (len <= 1) return;
+  uint8_t idLen = data[0];
+  if (len < 1 + idLen) return;
 
-  // 콜백에서 풀 파싱은 부담 큼 -> 아주 가벼운 형태 체크만
-  const char first = jsonBuf[0];
-  const char last  = jsonBuf[jsonLen - 1];
-  if (!((first == '{' && last == '}') || (first == '[' && last == ']'))) {
-    return false;
+  char sender_id_str[16];
+  memcpy(sender_id_str, data + 1, idLen);
+  sender_id_str[idLen] = '\0';
+  int senderID = atoi(sender_id_str);
+  if (senderID == SELF_ID) return;
+
+  const uint8_t* jsonData = data + 1 + idLen;
+  size_t jsonLen = len - 1 - idLen;
+
+  StaticJsonDocument<1024> payload;
+  DeserializationError error = deserializeJson(payload, jsonData, jsonLen);
+  if (error) return;
+
+  StaticJsonDocument<1024> decoded;
+  if (MessageCodec::decode(payload, decoded)) {
+    ReceivedMessage& msg = receivedMessages_MAP[senderID];
+    msg.msg = decoded;
+    msg.timestamp = millis();
+    espnow_rx_bytes += (uint32_t)len;
+    dirtyNeighbors = true;
   }
-
-  // 수신 콜백에서 오래 잠그지 않기: 즉시 락 실패 시 드랍
-  if (xSemaphoreTake(mapLock, 0) != pdTRUE) {
-    return false;
-  }
-
-  // 기존 String capacity 재사용(힙 단편화 완화)
-  String& dst = receivedJSON_MAP[senderID];
-  dst.remove(0);
-  dst.reserve(jsonLen + 1);
-  dst.concat(jsonBuf, jsonLen);
-
-  CommRecvTime_MAP[senderID] = millis();
-  xSemaphoreGive(mapLock);
-  return true;
 }
 
 void onEspNowRecv(const esp_now_recv_info_t *recv_info, const uint8_t *incoming, int len) {
   (void)recv_info;
-  if (len <= 1) return;
-
-  uint8_t idLen = incoming[0];
-  if (len < 1 + idLen) return;
-
-  String senderID = String((const char*)(&incoming[1]), idLen);
-  if (senderID == SELF_ID) return;
-
-  int jsonLen = len - (1 + idLen);
-  if (jsonLen <= 0) return;
-
-  if (update_Broadcast_recv_JSON_MAP(senderID, (const char*)(&incoming[1 + idLen]), (size_t)jsonLen)) {
-    espnow_rx_bytes += (uint32_t)len;
-    dirtyNeighbors = true;
-  }
+  handleEspNowMessage(incoming, len);
 }
 
 void ensureBroadcastPeer() {
@@ -252,34 +419,32 @@ void ensureBroadcastPeer() {
 }
 
 void broadcastSelfMessageIfDue() {
-  static uint32_t nextInterval = 40;
-  if (millis() - lastBroadcast < nextInterval) return;
-
-  lastBroadcast = millis();
-  nextInterval = random(MIN_BROADCAST_MS, MAX_BROADCAST_MS);
-
-  // Lock selfMessageDoc for reading
-  if (xSemaphoreTake(selfMsgLock, pdMS_TO_TICKS(5)) != pdTRUE) return;
+  if (!hasMessageToShare) return;
   
-  if (selfMessageDoc.isNull() || selfMessageDoc.size() == 0) {
-    xSemaphoreGive(selfMsgLock);
-    return;
-  }
+  unsigned long now = millis();
+  unsigned long interval = random(MIN_BROADCAST_MS, MAX_BROADCAST_MS + 1);
+  if (now - lastBroadcast < interval) return;
+
+  lastBroadcast = now;
 
   ensureBroadcastPeer();
 
-  size_t jsonLen = serializeJson(selfMessageDoc, g_jsonBuf, sizeof(g_jsonBuf));
-  xSemaphoreGive(selfMsgLock);
-  
+  // Encode message using MessageCodec
+  StaticJsonDocument<1024> encoded;
+  if (!MessageCodec::encode(SELF_ID, messageToShare, encoded)) return;
+
+  size_t jsonLen = serializeJson(encoded, g_jsonBuf, sizeof(g_jsonBuf));
   if (jsonLen == 0) return;
 
-  uint8_t idLen = (uint8_t)SELF_ID.length();
+  char idStr[16];
+  snprintf(idStr, sizeof(idStr), "%d", SELF_ID);
+  uint8_t idLen = strlen(idStr);
   size_t total = 1 + (size_t)idLen + jsonLen;
 
   if ((int)total > ESPNOW_MAX_PAYLOAD) return;
 
   g_pkt[0] = idLen;
-  memcpy(&g_pkt[1], SELF_ID.c_str(), idLen);
+  memcpy(&g_pkt[1], idStr, idLen);
   memcpy(&g_pkt[1 + idLen], g_jsonBuf, jsonLen);
 
   uint8_t bcast[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
@@ -288,167 +453,129 @@ void broadcastSelfMessageIfDue() {
 }
 
 // =============================================================================
-// TCP COMMUNICATION (Core 0)
+// Get nearby agents (from ESP-NOW messages)
 // =============================================================================
-void handleTcpClients() {
-  WiFiClient newcomer = tcpServer.available();
-  if (newcomer) {
-    newcomer.setTimeout(10);
-    newcomer.setNoDelay(true);
-
-    bool placed = false;
-    for (auto &c : tcpClients) {
-      if (!c || !c.connected()) {
-        c.stop();
-        c = newcomer;
-        placed = true;
-        break;
-      }
-    }
-    if (!placed) tcpClients.push_back(newcomer);
-  }
-
-  for (auto &c : tcpClients) {
-    if (c && c.connected() && c.available()) {
-      String line = c.readStringUntil('\n');
-      
-      // Lock selfMessageDoc for writing
-      if (xSemaphoreTake(selfMsgLock, pdMS_TO_TICKS(10)) == pdTRUE) {
-        if (deserializeJson(selfMessageDoc, line) == DeserializationError::Ok) {
-          dirtySelf = true;
-        }
-        xSemaphoreGive(selfMsgLock);
-      }
+std::vector<int> getNearbyAgents() {
+  std::vector<int> nearby;
+  unsigned long now = millis();
+  for (const auto& pair : receivedMessages_MAP) {
+    if (now - pair.second.timestamp <= PEER_LINK_DROP_MS) {
+      nearby.push_back(pair.first);
     }
   }
-}
-
-void sendMonitorToTcpClients() {
-  static unsigned long lastTcpSend = 0;
-  if (millis() - lastTcpSend < 50) return;
-
-  // [FIX #1] 큰 DynamicJsonDocument 제거:
-  // mapLock을 짧게 잡고 스냅샷만 뜬 뒤, 락 풀고 String으로 한 줄 JSON 구성
-  std::vector<std::pair<String, String>> snapshot;
-  snapshot.reserve(16);
-
-  const unsigned long now = millis();
-
-  if (xSemaphoreTake(mapLock, pdMS_TO_TICKS(5)) == pdTRUE) {
-    for (auto const &kv : receivedJSON_MAP) {
-      auto itT = CommRecvTime_MAP.find(kv.first);
-      if (itT != CommRecvTime_MAP.end() && (now - itT->second <= PEER_LINK_DROP_MS)) {
-        snapshot.push_back({kv.first, kv.second}); // (senderID, raw json)
-      }
-    }
-    xSemaphoreGive(mapLock);
-  }
-
-  // 한 줄 JSON: {"agent_id":"11","received_messages":{"03":{...},"04":{...}}}
-  size_t est = 64;
-  for (auto &kv : snapshot) est += 6 + kv.first.length() + kv.second.length();
-
-  String out;
-  out.reserve(est);
-  out += "{\"agent_id\":\"";
-  out += SELF_ID;
-  out += "\",\"received_messages\":{";
-
-  bool first = true;
-  for (auto &kv : snapshot) {
-    if (!first) out += ",";
-    first = false;
-
-    out += "\"";
-    out += kv.first;
-    out += "\":";
-    out += kv.second; // raw JSON object/array
-  }
-
-  out += "}}\n";
-
-  for (auto &c : tcpClients) {
-    if (c && c.connected()) {
-      c.print(out);
-    }
-  }
-
-  dirtySelf = dirtyNeighbors = false;
-  lastTcpSend = millis();
-
-  // Cleanup disconnected clients
-  for (auto &c : tcpClients) {
-    if (c && !c.connected()) c.stop();
-  }
-  tcpClients.erase(std::remove_if(tcpClients.begin(), tcpClients.end(),
-    [](WiFiClient& c) { return !c.connected(); }), tcpClients.end());
+  return nearby;
 }
 
 // =============================================================================
-// UDP MOTION COMMANDS (Core 0 receives, Core 1 executes)
+// UDP COMMUNICATION (Core 0) - Position & Tasks from PC
 // =============================================================================
+std::vector<std::vector<float>> tasksRaw;
+
 void handleUdpPacket() {
-  static char udpBuffer[256];
-  
   int packetSize = udp.parsePacket();
   if (!packetSize) return;
 
-  // Keep only latest packet
-  while (packetSize) {
-    int len = udp.read(udpBuffer, 255);
-    if (len > 0) udpBuffer[len] = 0;
-    packetSize = udp.parsePacket();
+  char buffer[2048];
+  int len = udp.read(buffer, sizeof(buffer) - 1);
+  if (len <= 0) return;
+  buffer[len] = '\0';
+
+  StaticJsonDocument<2048> doc;
+  DeserializationError error = deserializeJson(doc, buffer, len);
+  if (error) return;
+
+  // Check if message is for this robot
+  if (doc.containsKey("id")) {
+    int msg_id = doc["id"];
+    if (msg_id != SELF_ID) return;
   }
 
-  // STOP command
-  if (strncasecmp(udpBuffer, "STOP", 4) == 0) {
-    stopRequested = true;
-    return;
+  // Update position
+  if (doc.containsKey("x") && doc.containsKey("y")) {
+    positionX = doc["x"];
+    positionY = doc["y"];
+    heading = doc.containsKey("yaw") ? doc["yaw"].as<float>() : 0.0f;
   }
 
-  // G command: "G <angle> <distance>"
-  if (udpBuffer[0] == 'G' || udpBuffer[0] == 'g') {
-    float angle = 0, dist = 0;
-    if (sscanf(udpBuffer + 1, "%f %f", &angle, &dist) == 2) {
-      if (dist >= MIN_DIST_MM) {
-        targetAngleDeg = angle;
-        targetDistMm = dist;
-        newMotionCommand = true;  // Signal to Core 1
+  // Update tasks
+  if (doc.containsKey("t")) {
+    tasksRaw.clear();
+    JsonArray tasks = doc["t"];
+    for (JsonArray task : tasks) {
+      if (task.size() >= 4) {
+        std::vector<float> task_data;
+        task_data.push_back(task[0]);
+        task_data.push_back(task[1]);
+        task_data.push_back(task[2]);
+        task_data.push_back(task[3]);
+        tasksRaw.push_back(task_data);
       }
     }
   }
 }
 
 // =============================================================================
-// COMMUNICATION TASK (Core 0) - HIGH PRIORITY
+// Send CBBA Status to PC
 // =============================================================================
-void commTask(void* parameter) {
-  Serial.println("[Core 0] Communication task started");
-  
-  for (;;) {
-    // WiFi reconnection
-    if (WiFi.status() != WL_CONNECTED) {
-      for (auto &c : tcpClients) c.stop();
-      tcpClients.clear();
-      WiFi.reconnect();
-      vTaskDelay(pdMS_TO_TICKS(100));
-      continue;
-    }
+unsigned long lastStatusReportMs = 0;
 
-    // ===== All communication handling =====
-    handleTcpClients();           // TCP: PC <-> Robot
-    broadcastSelfMessageIfDue();  // ESP-NOW: Robot <-> Robot
-    sendMonitorToTcpClients();    // Send monitor to PC
-    handleUdpPacket();            // UDP: Motion commands
+void sendStatusToPC(CBBA* cbba) {
+  unsigned long now = millis();
+  if (now - lastStatusReportMs < STATUS_REPORT_INTERVAL_MS) return;
+  lastStatusReportMs = now;
 
-    // Short delay to prevent watchdog trigger
-    vTaskDelay(pdMS_TO_TICKS(1));
+  StaticJsonDocument<512> doc;
+  doc["type"] = "status";
+  doc["id"] = SELF_ID;
+  doc["assigned"] = cbba->get_assigned_task_id();
+
+  // Bundle (planned tasks)
+  JsonArray bundle_arr = doc.createNestedArray("bundle");
+  const std::vector<int>& bundle = cbba->get_bundle();
+  for (int task_id : bundle) {
+    bundle_arr.add(task_id);
+  }
+
+  // Nearby agents (ESP-NOW connections)
+  JsonArray nearby_arr = doc.createNestedArray("nearby");
+  std::vector<int> nearby = getNearbyAgents();
+  for (int agent_id : nearby) {
+    nearby_arr.add(agent_id);
+  }
+
+  // Serialize and send
+  char json_buffer[512];
+  size_t len = serializeJson(doc, json_buffer, sizeof(json_buffer));
+  if (len > 0) {
+    udp.beginPacket(PC_HOST, PC_STATUS_PORT);
+    udp.write((const uint8_t*)json_buffer, len);
+    udp.endPacket();
   }
 }
 
 // =============================================================================
 // MOTION CONTROL TASK (Core 1) - INDEPENDENT
 // =============================================================================
+static float normalize_angle(float angle) {
+  while (angle > M_PI) angle -= 2 * M_PI;
+  while (angle < -M_PI) angle += 2 * M_PI;
+  return angle;
+}
+
+void compute_motion(float& angle_deg, float& dist_mm) {
+  if (!hasTargetPosition) {
+    angle_deg = 0;
+    dist_mm = 0;
+    return;
+  }
+  float dx = targetX - positionX;
+  float dy = targetY - positionY;
+  dist_mm = sqrtf(dx * dx + dy * dy);
+  float desired_heading = atan2f(dy, dx);
+  float angle_diff = normalize_angle(desired_heading - heading);
+  angle_deg = angle_diff * 180.0f / M_PI;
+}
+
 void start_motion(float angle_deg, float dist_mm) {
   if (state == STATE_AVOID || state == STATE_ESCAPING || state == STATE_EMERGENCY) {
     return;
@@ -456,7 +583,6 @@ void start_motion(float angle_deg, float dist_mm) {
 
   start_left_count  = left_encoder_count;
   start_right_count = right_encoder_count;
-  integral_error = 0.0f;
 
   target_turn_pulses = (long)lroundf(fabsf(angle_deg) * PULSES_PER_DEGREE);
   target_move_pulses = (long)lroundf(fabsf(dist_mm)  * PULSES_PER_MM);
@@ -510,7 +636,6 @@ void control_loop(int r1, int r2, int r3, int r4, int r5) {
         if (target_move_pulses > 0) {
           start_left_count  = left_encoder_count;
           start_right_count = right_encoder_count;
-          integral_error = 0.0f;
           state = STATE_MOVING;
         } else {
           state = STATE_IDLE;
@@ -523,13 +648,16 @@ void control_loop(int r1, int r2, int r3, int r4, int r5) {
         Motors_stop();
         state = STATE_IDLE;
       } else {
-        long err = l_now - r_now;
-        integral_error += err;
-        float u = (K_P * (float)err) + (K_I * (float)integral_error);
-        int left_pwm  = constrain((int)lroundf(FWD_SPD - u), MIN_MOTOR_PWM, 255);
-        int right_pwm = constrain((int)lroundf(FWD_SPD + u), MIN_MOTOR_PWM, 255);
-        Left_mot_forward(left_pwm);
-        Right_mot_forward(right_pwm);
+        // Use target-based motion update instead of fixed distance
+        if (hasTargetPosition && avg >= UPDATE_THRESHOLD_PULSES) {
+          float angle_deg, dist_mm;
+          compute_motion(angle_deg, dist_mm);
+          if (dist_mm >= MIN_DIST_MM) {
+            start_motion(angle_deg, dist_mm);
+            return;
+          }
+        }
+        Motors_forward(FWD_SPD);
       }
       break;
 
@@ -571,31 +699,57 @@ void control_loop(int r1, int r2, int r3, int r4, int r5) {
   }
 }
 
+// LED Status indicator
+void update_led(RobotState state, bool has_task) {
+  if (state == STATE_IDLE) {
+    if (has_task) {
+      Set_LED(1, 0, 50, 0);
+      Set_LED(2, 0, 50, 0);
+    } else {
+      Set_LED(1, 0, 0, 30);
+      Set_LED(2, 0, 0, 30);
+    }
+  } else if (state == STATE_TURNING) {
+    Set_LED(1, 0, 0, 50);
+    Set_LED(2, 0, 0, 50);
+  } else if (state == STATE_MOVING) {
+    Set_LED(1, 0, 50, 0);
+    Set_LED(2, 0, 50, 0);
+  } else if (state == STATE_AVOID) {
+    Set_LED(1, 50, 50, 0);
+    Set_LED(2, 50, 50, 0);
+  } else if (state == STATE_ESCAPING) {
+    Set_LED(1, 50, 25, 0);
+    Set_LED(2, 50, 25, 0);
+  } else if (state == STATE_EMERGENCY) {
+    Set_LED(1, 50, 0, 0);
+    Set_LED(2, 50, 0, 0);
+  }
+}
+
 void motionTask(void* parameter) {
   Serial.println("[Core 1] Motion control task started");
+  int led_counter = 0;
   
   for (;;) {
-    // Check for STOP command from Core 0
-    if (stopRequested) {
-      Motors_stop();
-      clear_motion_targets();
-      state = STATE_IDLE;
-      stopRequested = false;
+    // Check if target is cleared
+    if (!hasTargetPosition) {
+      if (state != STATE_AVOID && state != STATE_ESCAPING && state != STATE_EMERGENCY) {
+        Motors_stop();
+        clear_motion_targets();
+        state = STATE_IDLE;
+      }
     }
 
-    // Check for new motion command from Core 0
-    if (newMotionCommand) {
-      // Only accept if not in obstacle avoidance
-      if (state == STATE_MOVING) {
-        long l_now = labs(left_encoder_count - start_left_count);
-        long r_now = labs(right_encoder_count - start_right_count);
-        if (((l_now + r_now) / 2) >= UPDATE_THRESHOLD_PULSES) {
-          start_motion(targetAngleDeg, targetDistMm);
+    // Handle new target position
+    if (hasTargetPosition) {
+      if (state == STATE_IDLE) {
+        float angle_deg, dist_mm;
+        compute_motion(angle_deg, dist_mm);
+        if (dist_mm >= MIN_DIST_MM) {
+          start_motion(angle_deg, dist_mm);
         }
-      } else if (state == STATE_IDLE || state == STATE_TURNING) {
-        start_motion(targetAngleDeg, targetDistMm);
       }
-      newMotionCommand = false;
     }
 
     // Read IR sensors (this is slow, but doesn't block Core 0 now!)
@@ -608,9 +762,60 @@ void motionTask(void* parameter) {
     // Run motion control
     control_loop(r1, r2, r3, r4, r5);
 
+    // Update LED status
+    led_counter++;
+    if (led_counter >= 50) {
+      update_led(state, hasTargetPosition);
+      led_counter = 0;
+    }
+
     // Motion task runs at ~50Hz (20ms period)
     vTaskDelay(pdMS_TO_TICKS(50));
   }
+}
+
+// =============================================================================
+// BEHAVIOR TREE BUILDER
+// =============================================================================
+BTNode* build_default_tree_with_explore() {
+    return TreeBuilder::ReactiveSequence("Root", {
+        new GatherLocalInfo(),
+        TreeBuilder::ReactiveSequence("MainSequence", {
+            TreeBuilder::ReactiveFallback("TaskAssignmentFallback", {
+                new AssignTask(),
+                new Explore()
+            }),
+            TreeBuilder::ReactiveFallback("TaskExecutionFallback", {
+                new IsTaskCompleted(),
+                TreeBuilder::ReactiveSequence("ExecutionSequence", {
+                    TreeBuilder::ReactiveFallback("MovementFallback", {
+                        new IsArrivedAtTarget(),
+                        new MoveToTarget()
+                    }),
+                    new ExecuteTask()
+                })
+            })
+        })
+    });
+}
+
+BTNode* build_default_tree_no_explore() {
+    return TreeBuilder::ReactiveSequence("Root", {
+        new GatherLocalInfo(),
+        TreeBuilder::ReactiveSequence("MainSequence", {
+            new AssignTask(),
+            TreeBuilder::ReactiveFallback("TaskExecutionFallback", {
+                new IsTaskCompleted(),
+                TreeBuilder::ReactiveSequence("ExecutionSequence", {
+                    TreeBuilder::ReactiveFallback("MovementFallback", {
+                        new IsArrivedAtTarget(),
+                        new MoveToTarget()
+                    }),
+                    new ExecuteTask()
+                })
+            })
+        })
+    });
 }
 
 void setupNetwork() {
@@ -641,17 +846,13 @@ void setupNetwork() {
 
   Serial.println("\n[WiFi] Connected!");
   Serial.printf("[WiFi] IP Address: %s\n", WiFi.localIP().toString().c_str());
-  Serial.printf("[WiFi] Board ID (SELF_ID): %s\n", SELF_ID.c_str());
+  Serial.printf("[WiFi] Board ID (SELF_ID): %d\n", SELF_ID);
 
   // 실제 채널 출력 (ESPNOW는 이 채널과 동일해야 함)
   uint8_t primary = 0;
   wifi_second_chan_t second = WIFI_SECOND_CHAN_NONE;
   esp_wifi_get_channel(&primary, &second);
   Serial.printf("[WiFi] Channel: %d\n", primary);
-
-  // Start TCP server
-  tcpServer.begin();
-  Serial.printf("[TCP] Server on port %d\n", TCP_PORT);
 
   // Start UDP
   udp.begin(UDP_PORT);
@@ -676,8 +877,6 @@ void setup() {
   delay(SERIAL_STABILIZE_DELAY_MS);
 
   randomSeed(esp_random());
-  mapLock = xSemaphoreCreateMutex();
-  selfMsgLock = xSemaphoreCreateMutex();
 
   // Initialize Mona robot hardware
   Mona_ESP_init();
@@ -690,23 +889,33 @@ void setup() {
 
   setupNetwork();
 
-  Serial.println("=================================");
-  Serial.println("MONA Firmware v2 - Dual Core");
-  Serial.println("- Core 0: Communication (TCP/ESP-NOW/UDP)");
-  Serial.println("- Core 1: Motion Control (IR/Motors)");
-  Serial.println("=================================");
+  Serial.println("==================================================");
+  Serial.printf("MONA Onboard Firmware - Agent %d\n", SELF_ID);
+  Serial.println("ESP-NOW v2 + PC Status Report");
+  Serial.println("CBBA + Behavior Tree | Onboard Processing");
+  Serial.printf("PC Status: %s:%d\n", PC_HOST, PC_STATUS_PORT);
+  Serial.println("==================================================");
 
-  // Create Communication Task on Core 0 (PRO_CPU)
-  // Higher priority (2) than default Arduino loop
-  xTaskCreatePinnedToCore(
-    commTask,           // Task function
-    "CommTask",         // Name
-    8192,               // Stack size
-    NULL,               // Parameters
-    2,                  // Priority (higher = more important)
-    &commTaskHandle,    // Task handle
-    0                   // Core 0
-  );
+  // Initialize CBBA configuration
+  cbba_config.max_tasks_per_agent = 4;
+  cbba_config.lambda = 0.999f;
+  cbba_config.winning_bid_cancel = true;
+  cbba_config.no_bundle_duration_limit = 5.0f;
+  cbba_config.keep_moving_during_convergence = false;
+  cbba_config.work_rate = 1.0f;
+  cbba_config.max_speed = 0.25f;
+
+  // Initialize Task Manager
+  taskManager = new TaskManager();
+
+  // Initialize CBBA
+  CBBA* cbba = new CBBA(SELF_ID, cbba_config);
+
+  // Initialize Behavior Tree
+  BTContext* bt_ctx = new BTContext(SELF_ID);
+  bt_ctx->cbba = cbba;
+  BTNode* tree_root = build_default_tree_no_explore();
+  BehaviorTree* bt = new BehaviorTree(tree_root);
 
   // Create Motion Task on Core 1 (APP_CPU)
   // Lower priority (1), independent from communication
@@ -719,6 +928,101 @@ void setup() {
     &motionTaskHandle,  // Task handle
     1                   // Core 1
   );
+
+  Serial.println("==================================================");
+  Serial.println("System ready!");
+  Serial.println("==================================================");
+
+  // Main loop timing
+  unsigned long last_bt_tick_ms = 0;
+  const unsigned long bt_interval_ms = 100;
+  unsigned long last_debug_ms = 0;
+  const unsigned long debug_interval_ms = 2000;
+
+  // Main loop runs on Core 0
+  for (;;) {
+    unsigned long now = millis();
+
+    // WiFi reconnection
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("[WiFi] Reconnecting...");
+      WiFi.reconnect();
+      vTaskDelay(pdMS_TO_TICKS(100));
+      continue;
+    }
+
+    // ===== UDP: Receive position & tasks from PC =====
+    handleUdpPacket();
+
+    // Update task manager with received tasks
+    if (!tasksRaw.empty()) {
+      taskManager->update_from_message(tasksRaw);
+      bt_ctx->tasks = taskManager->get_all_tasks_ptr();
+      
+      // Clear completed tasks from CBBA
+      int current_task = cbba->get_assigned_task_id();
+      if (current_task >= 0 && !taskManager->is_task_valid(current_task)) {
+        cbba->clear_task(current_task);
+      }
+    }
+
+    // Update positions for CBBA and BT context
+    bt_ctx->position_x = positionX;
+    bt_ctx->position_y = positionY;
+    bt_ctx->yaw = heading;
+    cbba->set_position(positionX, positionY);
+
+    // ===== ESP-NOW: Process received messages =====
+    unsigned long msg_now = millis();
+    std::vector<StaticJsonDocument<1024>> received_msgs;
+    auto it = receivedMessages_MAP.begin();
+    while (it != receivedMessages_MAP.end()) {
+      if (msg_now - it->second.timestamp <= PEER_LINK_DROP_MS) {
+        received_msgs.push_back(it->second.msg);
+        ++it;
+      } else {
+        it = receivedMessages_MAP.erase(it);
+      }
+    }
+    for (auto& msg : received_msgs) {
+      cbba->receive_message_json(msg);
+    }
+
+    // ===== ESP-NOW: Broadcast CBBA message =====
+    cbba->get_message_to_share_json(messageToShare);
+    hasMessageToShare = true;
+    broadcastSelfMessageIfDue();
+
+    // ===== UDP: Send status to PC =====
+    sendStatusToPC(cbba);
+
+    // ===== Behavior Tree: Tick =====
+    if (now - last_bt_tick_ms >= bt_interval_ms) {
+      last_bt_tick_ms = now;
+      std::vector<CBBATask> cbba_tasks = taskManager->get_all_tasks();
+      int assigned_id = cbba->decide(cbba_tasks);
+      bt_ctx->assigned_task_id = assigned_id;
+      bt->tick(*bt_ctx);
+
+      // Update motion target from BT
+      if (bt_ctx->has_target_position) {
+        targetX = bt_ctx->target_position_x;
+        targetY = bt_ctx->target_position_y;
+        hasTargetPosition = true;
+      } else {
+        hasTargetPosition = false;
+      }
+    }
+
+    // ===== Debug output =====
+    if (now - last_debug_ms >= debug_interval_ms) {
+      last_debug_ms = now;
+      cbba->print_state();
+    }
+
+    // Short delay to prevent watchdog trigger
+    vTaskDelay(pdMS_TO_TICKS(5));
+  }
 }
 
 void loop() {
