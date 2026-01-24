@@ -54,21 +54,15 @@ int CBBA::decide(const std::vector<CBBATask>& tasks) {
     // Cache local tasks
     _local_tasks = tasks;
     
-    // ===== [MODIFIED] Clean up completed tasks from _y and _z =====
+    // ===== Clean up completed tasks from _y and _z =====
     _cleanup_completed_tasks();
     
-    // Check if the existing task is done
+    // ===== Remove completed tasks from bundle and path =====
+    _remove_completed_from_bundle();
     if (_assigned_task_id >= 0) {
         CBBATask* assigned = _find_task(_assigned_task_id);
         if (assigned == nullptr || assigned->completed) {
-            if (!_path.empty() && _path[0] == _assigned_task_id) {
-                _path.erase(_path.begin());
-                if (!_bundle.empty()) {
-                    _bundle.erase(_bundle.begin());
-                }
-            }
             _assigned_task_id = -1;
-            _phase = CBBAPhase::BUILD_BUNDLE;
         }
     }
     
@@ -84,6 +78,8 @@ int CBBA::decide(const std::vector<CBBATask>& tasks) {
     if (_config.winning_bid_cancel) {
         if (_bundle.empty()) {
             _no_bundle_duration += dt;
+        } else {
+            _no_bundle_duration = 0;  // Reset when we have tasks
         }
         
         if (_no_bundle_duration > _config.no_bundle_duration_limit) {
@@ -96,53 +92,79 @@ int CBBA::decide(const std::vector<CBBATask>& tasks) {
         }
     }
     
-    // ===== Phase 1: Build Bundle =====
-    if (_phase == CBBAPhase::BUILD_BUNDLE) {
+    // ===== Always try to fill bundle to max =====
+    int max_bundle_size = std::min(_config.max_tasks_per_agent, (int)tasks.size());
+    if ((int)_bundle.size() < max_bundle_size) {
         _build_bundle(tasks);
-        _phase = CBBAPhase::ASSIGNMENT_CONSENSUS;
-        _assigned_task_id = -1;
-        return -1;
     }
     
     // ===== Phase 2: Assignment Consensus =====
-    if (_phase == CBBAPhase::ASSIGNMENT_CONSENSUS) {
-        _update_time_stamp();
-        
-        for (const CBBATask& task : tasks) {
-            for (const CBBAMessage& msg : _messages_received) {
-                if (msg.agent_id == _agent_id) continue;
-                _apply_consensus_rules(task.task_id, msg);
-            }
+    _update_time_stamp();
+    
+    for (const CBBATask& task : tasks) {
+        for (const CBBAMessage& msg : _messages_received) {
+            if (msg.agent_id == _agent_id) continue;
+            _apply_consensus_rules(task.task_id, msg);
         }
-        
-        _messages_received.clear();
-        
-        std::vector<int> updated_bundle, updated_path;
-        _update_bundle_and_path(updated_bundle, updated_path);
-        
-        if (_config.winning_bid_cancel) {
-            if (!updated_bundle.empty()) {
-                _no_bundle_duration = 0;
-            }
+    }
+    
+    _messages_received.clear();
+    
+    std::vector<int> updated_bundle, updated_path;
+    bool bundle_changed = _update_bundle_and_path(updated_bundle, updated_path);
+    
+    if (_config.winning_bid_cancel) {
+        if (!updated_bundle.empty()) {
+            _no_bundle_duration = 0;
         }
+    }
+    
+    if (bundle_changed) {
+        _bundle = updated_bundle;
+        _path = updated_path;
         
-        if (updated_bundle == _bundle) {
-            _assigned_task_id = _path.empty() ? -1 : _path[0];
-            return _assigned_task_id;
+        // After consensus changes, try to refill bundle again
+        max_bundle_size = std::min(_config.max_tasks_per_agent, (int)tasks.size());
+        if ((int)_bundle.size() < max_bundle_size) {
+            _build_bundle(tasks);
+        }
+    }
+    
+    // Set assigned task to first in path
+    _assigned_task_id = _path.empty() ? -1 : _path[0];
+    
+    return _assigned_task_id;
+}
+
+// ===== [NEW] Remove completed tasks from bundle and path =====
+void CBBA::_remove_completed_from_bundle() {
+    // Build set of valid (non-completed) task IDs
+    std::set<int> valid_task_ids;
+    for (const auto& task : _local_tasks) {
+        if (!task.completed) {
+            valid_task_ids.insert(task.task_id);
+        }
+    }
+    
+    // Remove completed tasks from bundle
+    auto bundle_it = _bundle.begin();
+    while (bundle_it != _bundle.end()) {
+        if (valid_task_ids.find(*bundle_it) == valid_task_ids.end()) {
+            bundle_it = _bundle.erase(bundle_it);
         } else {
-            _bundle = updated_bundle;
-            _path = updated_path;
-            _assigned_task_id = -1;
-            _phase = CBBAPhase::BUILD_BUNDLE;
+            ++bundle_it;
         }
     }
     
-    if (_config.keep_moving_during_convergence) {
-        _assigned_task_id = _path.empty() ? -1 : _path[0];
-        return _assigned_task_id;
+    // Remove completed tasks from path
+    auto path_it = _path.begin();
+    while (path_it != _path.end()) {
+        if (valid_task_ids.find(*path_it) == valid_task_ids.end()) {
+            path_it = _path.erase(path_it);
+        } else {
+            ++path_it;
+        }
     }
-    
-    return -1;
 }
 
 // ===== [NEW] Clean up completed tasks from internal maps =====
@@ -675,10 +697,11 @@ void CBBA::_merge_timestamps(const std::map<int, unsigned long>& other) {
 }
 
 void CBBA::print_state() const {
-    Serial.printf("[CBBA] Agent %d | Phase: %s | Assigned: %d\n",
+    Serial.printf("[CBBA] Agent %d | Assigned: %d | Bundle size: %d/%d\n",
         _agent_id,
-        (_phase == CBBAPhase::BUILD_BUNDLE) ? "BUILD" : "CONSENSUS",
-        _assigned_task_id);
+        _assigned_task_id,
+        (int)_bundle.size(),
+        _config.max_tasks_per_agent);
     
     Serial.print("  Bundle: [");
     for (size_t i = 0; i < _bundle.size(); i++) {
@@ -687,21 +710,10 @@ void CBBA::print_state() const {
     }
     Serial.println("]");
     
-    Serial.print("  Winners (z): {");
-    bool first = true;
-    for (const auto& pair : _z) {
-        if (!first) Serial.print(", ");
-        Serial.printf("%d:%d", pair.first, pair.second);
-        first = false;
+    Serial.print("  Path: [");
+    for (size_t i = 0; i < _path.size(); i++) {
+        if (i > 0) Serial.print(", ");
+        Serial.print(_path[i]);
     }
-    Serial.println("}");
-    
-    Serial.print("  Bids (y): {");
-    first = true;
-    for (const auto& pair : _y) {
-        if (!first) Serial.print(", ");
-        Serial.printf("%d:%.2f", pair.first, pair.second);
-        first = false;
-    }
-    Serial.println("}");
+    Serial.println("]");
 }

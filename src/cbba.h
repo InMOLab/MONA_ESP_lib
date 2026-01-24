@@ -9,6 +9,7 @@
   - Phase 2: Assignment Consensus (Rules 1-17)
   
   [MODIFIED] Added _cleanup_completed_tasks() for filtering completed tasks
+  [MODIFIED] Added _remove_completed_from_bundle() for incremental bundle maintenance
 */
 
 #ifndef CBBA_H
@@ -101,6 +102,11 @@ struct CBBAMessage {
 /**
  * Consensus-Based Bundle Algorithm implementation.
  * Follows the algorithm from the CBBA paper with full consensus rules.
+ * 
+ * [MODIFIED] Bundle is now incrementally maintained:
+ * - When a task is completed, it's removed from bundle
+ * - New tasks are immediately added to fill bundle back to max
+ * - This ensures bundle stays at max_tasks_per_agent whenever possible
  */
 class CBBA {
 public:
@@ -270,6 +276,8 @@ private:
      * Called at the beginning of decide() to remove stale entries
      */
     void _cleanup_completed_tasks();
+
+    void _remove_completed_from_bundle();
     
     // Utility
     CBBATask* _find_task(int task_id);
