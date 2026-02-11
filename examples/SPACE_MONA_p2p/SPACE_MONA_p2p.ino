@@ -20,14 +20,18 @@ const uint16_t SERVER_PORT = 8080;
 // JSON 버퍼는 넉넉하게(단, 실제 ESPNOW payload는 1470 제한)
 const size_t JSON_SIZE = 2048;
 const int TOTAL_ROBOTS = 12;
-const uint32_t Min_Broadcast_MS = 50;
-const uint32_t Max_Broadcast_MS = 100;
+
+// ====== TIMING CONSTANTS (누적 오차 방지 방식) ======
+const uint32_t BROADCAST_MIN_INTERVAL_MS = 20;
+const uint32_t BROADCAST_MAX_INTERVAL_MS = 40;
+const uint32_t TCP_MONITORING_INTERVAL_MS = 50;
+const uint32_t MEMORY_CLEANUP_INTERVAL_MS = 5000;
+const uint32_t STATS_PRINT_INTERVAL_MS = 5000;
+
 const uint32_t Peer_LinkDrop_MS = 900;
 const uint32_t WIFI_RECONNECT_INTERVAL_MS = 300;
 const uint32_t WIFI_TIMEOUT_MS = 10000;
 const uint32_t WIFI_RETRY_DELAY_MS = 200;
-const uint32_t MONITORING_SEND_INTERVAL_MS = 50;
-const uint32_t INITIAL_BROADCAST_INTERVAL_MS = 40;
 const uint32_t SERIAL_STABILIZE_DELAY_MS = 1000;
 
 // ESPNOW v2 payload 최대
@@ -42,16 +46,69 @@ std::map<String, unsigned long> CommRecvTime_MAP;
 
 SemaphoreHandle_t mapLock;
 
-unsigned long lastBroadcast = 0;
+// ====== 누적 오차 방지를 위한 타이밍 변수 ======
+unsigned long lastBroadcast_ms = 0;
+unsigned long lastTcpSend_ms = 0;
+unsigned long lastMemoryCleanup_ms = 0;
+unsigned long lastStatsPrint_ms = 0;
+uint32_t currentBroadcastInterval_ms = BROADCAST_MIN_INTERVAL_MS;
 
-// 큰 버퍼는 스택이 아니라 전역(static)로 (스택오버플로 방지)
+// ====== TIMING MONITORING ======
+unsigned long loopCount = 0;
+unsigned long maxLoopTime_us = 0;
+unsigned long minLoopTime_us = 999999;
+unsigned long totalLoopTime_us = 0;
+
+// ====== MEMORY MONITORING ======
+size_t currentMemoryUsage_bytes = 0;
+size_t peakMemoryUsage_bytes = 0;
+
 static char g_jsonBuf[JSON_SIZE];
 
 // ESPNOW 송신 패킷 고정 버퍼
 static uint8_t g_pkt[ESPNOW_MAX_PAYLOAD];
 
 // -------------------------
-// Update map (safe & fast)
+// Memory cleanup
+// -------------------------
+void cleanupStaleEntries() {
+  unsigned long now = millis();
+  
+  // 누적 오차 방지: 정확히 5초마다 실행
+  if ((unsigned long)(now - lastMemoryCleanup_ms) < MEMORY_CLEANUP_INTERVAL_MS) {
+    return;
+  }
+  
+  lastMemoryCleanup_ms += MEMORY_CLEANUP_INTERVAL_MS;
+  
+  xSemaphoreTake(mapLock, portMAX_DELAY);
+  
+  auto it = receivedJSON_MAP.begin();
+  int cleanedCount = 0;
+  
+  while (it != receivedJSON_MAP.end()) {
+    if ((unsigned long)(now - CommRecvTime_MAP[it->first]) > (Peer_LinkDrop_MS * 2)) {
+      delete it->second;
+      CommRecvTime_MAP.erase(it->first);
+      it = receivedJSON_MAP.erase(it);
+      
+      currentMemoryUsage_bytes -= JSON_SIZE;
+      cleanedCount++;
+    } else {
+      ++it;
+    }
+  }
+  
+  xSemaphoreGive(mapLock);
+  
+  if (cleanedCount > 0) {
+    Serial.printf("[MEMORY] Cleaned %d stale entries, current: %d bytes\n", 
+                  cleanedCount, currentMemoryUsage_bytes);
+  }
+}
+
+// -------------------------
+// Update map
 // -------------------------
 bool update_Broadcast_recv_JSON_MAP(const String& senderID, const char* jsonBuf, size_t jsonLen) {
   DynamicJsonDocument* doc = new DynamicJsonDocument(JSON_SIZE);
@@ -73,6 +130,7 @@ bool update_Broadcast_recv_JSON_MAP(const String& senderID, const char* jsonBuf,
     it->second = doc;
   } else {
     receivedJSON_MAP[senderID] = doc;
+    currentMemoryUsage_bytes += JSON_SIZE;
   }
   CommRecvTime_MAP[senderID] = millis();
 
@@ -121,11 +179,18 @@ void ensureBroadcastPeer() {
 }
 
 void broadcastSelfMessageIfDue() {
-  static uint32_t nextInterval = (INITIAL_BROADCAST_INTERVAL_MS);
-  if (millis() - lastBroadcast < nextInterval) return;
+  unsigned long now = millis();
+  
+  // 누적 오차 방지: (now - lastBroadcast_ms) 사용
+  if ((unsigned long)(now - lastBroadcast_ms) < currentBroadcastInterval_ms) {
+    return;
+  }
 
-  lastBroadcast = millis();
-  nextInterval = random(Min_Broadcast_MS, Max_Broadcast_MS);
+  // 누적 오차 방지: lastBroadcast_ms += interval
+  lastBroadcast_ms += currentBroadcastInterval_ms;
+  
+  // 다음 간격 설정 (충돌 회피를 위한 랜덤화)
+  currentBroadcastInterval_ms = random(BROADCAST_MIN_INTERVAL_MS, BROADCAST_MAX_INTERVAL_MS);
 
   if (selfMessageDoc.isNull()) return;
 
@@ -155,6 +220,83 @@ void broadcastSelfMessageIfDue() {
   }
 }
 
+// -------------------------
+// TCP Monitoring (누적 오차 방지)
+// -------------------------
+void sendTcpMonitoringIfDue() {
+  unsigned long now = millis();
+  
+  // 누적 오차 방지
+  if ((unsigned long)(now - lastTcpSend_ms) < TCP_MONITORING_INTERVAL_MS) {
+    return;
+  }
+  
+  lastTcpSend_ms += TCP_MONITORING_INTERVAL_MS;
+  
+  // 동적 메모리 할당 (실제 필요한 크기만)
+  size_t activeRobots = receivedJSON_MAP.size();
+  size_t monitorSize = JSON_SIZE * (activeRobots + 1);
+  
+  DynamicJsonDocument monitor(monitorSize);
+  monitor["agent_id"] = SELF_ID;
+  JsonObject rx = monitor.createNestedObject("received_messages");
+
+  xSemaphoreTake(mapLock, portMAX_DELAY);
+  for (auto const &kv : receivedJSON_MAP) {
+    if ((unsigned long)(now - CommRecvTime_MAP[kv.first]) <= Peer_LinkDrop_MS) {
+      rx[kv.first] = kv.second->as<JsonObject>();
+    }
+  }
+  xSemaphoreGive(mapLock);
+
+  String out;
+  serializeJson(monitor, out);
+  out += "\n";
+
+  for (auto &c : clients) {
+    if (c && c.connected()) {
+      c.print(out);
+    }
+  }
+  
+  // 피크 메모리 추적
+  size_t tempMemory = currentMemoryUsage_bytes + monitorSize;
+  if (tempMemory > peakMemoryUsage_bytes) {
+    peakMemoryUsage_bytes = tempMemory;
+  }
+}
+
+// -------------------------
+// Statistics printing
+// -------------------------
+void printTimingStats() {
+  unsigned long now = millis();
+  
+  // 누적 오차 방지
+  if ((unsigned long)(now - lastStatsPrint_ms) < STATS_PRINT_INTERVAL_MS) {
+    return;
+  }
+  
+  lastStatsPrint_ms += STATS_PRINT_INTERVAL_MS;
+  
+  if (loopCount == 0) return;
+  
+  unsigned long avgLoopTime_us = totalLoopTime_us / loopCount;
+  unsigned long jitter_us = maxLoopTime_us - minLoopTime_us;
+  
+  Serial.printf("[TIMING] Loops: %lu, Avg: %lu us, Min: %lu us, Max: %lu us\n",
+                loopCount, avgLoopTime_us, minLoopTime_us, maxLoopTime_us);
+  Serial.printf("[TIMING] Jitter: %lu us\n", jitter_us);
+  Serial.printf("[MEMORY] Current: %d bytes, Peak: %d bytes, Active robots: %d\n",
+                currentMemoryUsage_bytes, peakMemoryUsage_bytes, receivedJSON_MAP.size());
+  
+  // 통계 리셋
+  loopCount = 0;
+  totalLoopTime_us = 0;
+  maxLoopTime_us = 0;
+  minLoopTime_us = 999999;
+}
+
 void setupNetwork() {
   WiFi.mode(WIFI_STA);
 
@@ -171,7 +313,7 @@ void setupNetwork() {
   while (WiFi.status() != WL_CONNECTED) {
     delay(WIFI_RECONNECT_INTERVAL_MS);
     Serial.print(".");
-    if (millis() - t0 > (WIFI_TIMEOUT_MS)) {
+    if (millis() - t0 > WIFI_TIMEOUT_MS) {
       Serial.println("\n[WiFi] connect timeout -> retry");
       WiFi.disconnect(true, true);
       delay(WIFI_RETRY_DELAY_MS);
@@ -214,16 +356,31 @@ void setup() {
   randomSeed(esp_random());
   mapLock = xSemaphoreCreateMutex();
 
+  // 초기 메모리 설정
+  currentMemoryUsage_bytes = JSON_SIZE;  // selfMessageDoc
+  peakMemoryUsage_bytes = JSON_SIZE;
+  
+  // 타이밍 초기화 (millis()로 현재 시간 설정)
+  unsigned long now = millis();
+  lastBroadcast_ms = now;
+  lastTcpSend_ms = now;
+  lastMemoryCleanup_ms = now;
+  lastStatsPrint_ms = now;
+  
+  // 첫 브로드캐스트 간격 랜덤화
+  currentBroadcastInterval_ms = random(BROADCAST_MIN_INTERVAL_MS, BROADCAST_MAX_INTERVAL_MS);
+
   setupNetwork();
 }
 
 void loop() {
   // Wi-Fi 끊김 복구
+    unsigned long loopStart_us = micros();
   if (WiFi.status() != WL_CONNECTED) {
     for (auto &c : clients) c.stop();
     clients.clear();
     WiFi.reconnect();
-    delay(10);
+    yield();
     return;
   }
 
@@ -255,42 +412,33 @@ void loop() {
 
   // ESPNOW 브로드캐스트
   broadcastSelfMessageIfDue();
+  
+  // 2. TCP 모니터링 송신
+  sendTcpMonitoringIfDue();
+  
+  // 3. 메모리 정리 (주기적)
+  cleanupStaleEntries();
+  
+  // 4. 통계 출력 (주기적)
+  printTimingStats();
 
-  // TCP 모니터 송신
-  static unsigned long lastTcpSend = 0;
-  if (millis() - lastTcpSend > (MONITORING_SEND_INTERVAL_MS)) {
-    DynamicJsonDocument monitor(JSON_SIZE * TOTAL_ROBOTS);
-    monitor["agent_id"] = SELF_ID;
-    JsonObject rx = monitor.createNestedObject("received_messages");
-
-    unsigned long now = millis();
-    xSemaphoreTake(mapLock, portMAX_DELAY);
-    for (auto const &kv : receivedJSON_MAP) {
-      if (now - CommRecvTime_MAP[kv.first] <= Peer_LinkDrop_MS) {
-        rx[kv.first] = kv.second->as<JsonObject>();
-      }
-    }
-    xSemaphoreGive(mapLock);
-
-    String out;
-    serializeJson(monitor, out);
-    out += "\n";
-
-    for (auto &c : clients) {
-      if (c && c.connected()) {
-        c.print(out);
-      }
-    }
-
-    lastTcpSend = millis();
-  }
-
-  // 끊긴 클라이언트 정리
+  // ========== TCP 클라이언트 정리 ==========
   for (auto &c : clients) {
     if (c && !c.connected()) c.stop();
   }
   clients.erase(std::remove_if(clients.begin(), clients.end(),
     [](WiFiClient& c){ return !c.connected(); }), clients.end());
 
-  delay(1);
+  // ========== 루프 시간 측정 ==========
+  unsigned long loopEnd_us = micros();
+  unsigned long loopDuration_us = loopEnd_us - loopStart_us;
+  
+  loopCount++;
+  totalLoopTime_us += loopDuration_us;
+  
+  if (loopDuration_us > maxLoopTime_us) maxLoopTime_us = loopDuration_us;
+  if (loopDuration_us < minLoopTime_us) minLoopTime_us = loopDuration_us;
+
+  // ========== CPU 양보 (다른 태스크에게 시간 할애) ==========
+  yield();
 }
