@@ -45,11 +45,11 @@ static const int PIN_ENCODER_RIGHT = 39;
 static const float ROTATION_DEADBAND_DEG = 5.0f;    // 미세 회전 무시 각도
 static const int   MIN_MOTOR_PWM         = 60;      // 모터 구동 최소 출력
 
-// ===================== PI 제어 게인 (개선) =====================
-static const float K_P = 0.5f;   // 비례 게인 감소 (0.95 → 0.5)
-static const float K_I = 0.002f; // 적분 게인 대폭 감소 (0.01 → 0.002)
+// ===================== PI 제어 게인 =====================
+static const float K_P = 0.5f;
+static const float K_I = 0.002f;
 
-// 적분 제한 추가
+// 적분 제한
 static const float INTEGRAL_LIMIT = 500.0f;
 
 // 오차 데드밴드
@@ -73,11 +73,9 @@ unsigned long oscillation_timer_start = 0;
 unsigned long emergency_back_until = 0;
 unsigned long emergency_spin_until = 0;
 
-// ===================== 엔코더 =====================
 volatile long left_encoder_count  = 0;
 volatile long right_encoder_count = 0;
 
-// Core 3.x에서는 인터럽트 핸들러에 IRAM_ATTR이 필수입니다.
 void IRAM_ATTR isr_left_encoder()  { left_encoder_count++; }
 void IRAM_ATTR isr_right_encoder() { right_encoder_count++; }
 
@@ -86,11 +84,6 @@ static long  start_right_count = 0;
 static long  target_turn_pulses = 0;
 static long  target_move_pulses = 0;
 static float integral_error = 0.0f;
-
-// ===================== IR 센서 캐시 (멀티코어용) =====================
-volatile int cached_ir[5] = {0, 0, 0, 0, 0};
-volatile bool ir_data_ready = false;
-static const unsigned long IR_READ_INTERVAL_MS = 20;
 
 // ===================== 제어 주기 관리 =====================
 static const unsigned long CONTROL_INTERVAL_MS = 5;  // 5ms 제어 주기
@@ -151,19 +144,13 @@ static inline void check_oscillation_and_escape(int current_direction) {
 // ===================== 개선된 PI 제어 =====================
 void pi_control(long l_now, long r_now, int* left_pwm, int* right_pwm) {
   long err = l_now - r_now;
-  
-  // 데드밴드 적용 - 작은 오차는 무시
   if (abs(err) < ERROR_DEADBAND) {
     err = 0;
   }
-  
-  // 적분 오차 누적 (제한 적용)
   integral_error += (float)err;
   if (integral_error > INTEGRAL_LIMIT) integral_error = INTEGRAL_LIMIT;
   if (integral_error < -INTEGRAL_LIMIT) integral_error = -INTEGRAL_LIMIT;
-  
   float u = (K_P * (float)err) + (K_I * integral_error);
-  
   *left_pwm  = constrain((int)lroundf(FWD_SPD - u), MIN_MOTOR_PWM, 255);
   *right_pwm = constrain((int)lroundf(FWD_SPD + u), MIN_MOTOR_PWM, 255);
 }
@@ -198,39 +185,6 @@ void update_status_led() {
   }
 }
 
-// ===================== Core 0: IR 센서 읽기 태스크 =====================
-TaskHandle_t irTaskHandle = NULL;
-
-void ir_sensor_task(void* parameter) {
-  while (true) {
-    int new_ir[5];
-    for (int i = 0; i < 5; i++) {
-      new_ir[i] = Get_IR(i + 1);
-    }
-    
-    // 캐시 업데이트 (atomic하게)
-    noInterrupts();
-    for (int i = 0; i < 5; i++) {
-      cached_ir[i] = new_ir[i];
-    }
-    ir_data_ready = true;
-    interrupts();
-    
-    vTaskDelay(pdMS_TO_TICKS(IR_READ_INTERVAL_MS));
-  }
-}
-
-// ===================== IR 값 가져오기 =====================
-void get_cached_ir(int* r1, int* r2, int* r3, int* r4, int* r5) {
-  noInterrupts();
-  *r1 = cached_ir[0];
-  *r2 = cached_ir[1];
-  *r3 = cached_ir[2];
-  *r4 = cached_ir[3];
-  *r5 = cached_ir[4];
-  interrupts();
-}
-
 // ===================== 함수 선언 =====================
 void start_motion(float angle_deg, float dist_mm);
 void handle_udp_packet();
@@ -238,10 +192,8 @@ void control_loop(int r1, int r2, int r3, int r4, int r5);
 
 void setup() {
   Serial.begin(115200);
-  
   Mona_ESP_init();
 
-  // Core 3.x 대응: 인터럽트 설정
   pinMode(PIN_ENCODER_LEFT, INPUT);
   pinMode(PIN_ENCODER_RIGHT, INPUT);
   attachInterrupt(digitalPinToInterrupt(PIN_ENCODER_LEFT), isr_left_encoder,  RISING);
@@ -257,42 +209,31 @@ void setup() {
   Serial.println(WiFi.localIP());
 
   udp.begin(localPort);
-  
-  // Core 0에서 IR 센서 읽기 태스크 시작
-  xTaskCreatePinnedToCore(
-    ir_sensor_task,    // 태스크 함수
-    "IR_Task",         // 태스크 이름
-    4096,              // 스택 크기
-    NULL,              // 파라미터
-    1,                 // 우선순위
-    &irTaskHandle,     // 태스크 핸들
-    0                  // Core 0에서 실행
-  );
-  
   // 초기 LED 상태
   Set_LED(1, 0, 30, 0);
   Set_LED(2, 0, 30, 0);
   
-  Serial.println("MONA ready with dual-core optimization!");
+  Serial.println("MONA ready puppet!");
 }
 
 void loop() {
   unsigned long now = millis();
-  
   // UDP 패킷 처리
   handle_udp_packet();
 
   // 제어 주기 확인 (5ms 간격)
   if (now - last_control_time >= CONTROL_INTERVAL_MS) {
     last_control_time = now;
-    
-    // 캐시된 IR 값 사용
-    int r1, r2, r3, r4, r5;
-    get_cached_ir(&r1, &r2, &r3, &r4, &r5);
-    
+
+    // 싱글코어: IR 센서를 loop()에서 직접 읽음
+    int r1 = Get_IR(1);
+    int r2 = Get_IR(2);
+    int r3 = Get_IR(3);
+    int r4 = Get_IR(4);
+    int r5 = Get_IR(5);
+
     control_loop(r1, r2, r3, r4, r5);
   }
-  
   // LED 업데이트 (100ms 간격)
   if (now - last_led_update >= LED_UPDATE_INTERVAL_MS) {
     last_led_update = now;
@@ -312,7 +253,7 @@ void start_motion(float angle_deg, float dist_mm) {
   target_turn_pulses = (long)lroundf(fabsf(angle_deg) * PULSES_PER_DEGREE);
   target_move_pulses = (long)lroundf(fabsf(dist_mm)  * PULSES_PER_MM);
 
-  if (target_turn_pulses > 0 && fabsf(angle_deg) > (ROTATION_DEADBAND_DEG)) {
+  if (target_turn_pulses > 0 && fabsf(angle_deg) > ROTATION_DEADBAND_DEG) {
     state = STATE_TURNING;
     if (angle_deg > 0) Motors_spin_right(TURN_SPD);
     else                Motors_spin_left(TURN_SPD);
@@ -407,7 +348,6 @@ void control_loop(int r1, int r2, int r3, int r4, int r5) {
         Motors_stop();
         state = STATE_IDLE;
       } else {
-        // 개선된 PI 제어 사용
         int left_pwm, right_pwm;
         pi_control(l_now, r_now, &left_pwm, &right_pwm);
         Left_mot_forward(left_pwm);
