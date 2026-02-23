@@ -14,7 +14,7 @@
 // ====== USER CONFIG ======
 const char* SSID       = "InMOLab";
 const char* PASSWORD   = "dlsahfoq104!";
-const String SELF_ID   = "11";
+const String SELF_ID   = "Your SELF_ID";
 const uint16_t SERVER_PORT = 8080;
 
 // JSON 버퍼는 넉넉하게(단, 실제 ESPNOW payload는 1470 제한)
@@ -22,9 +22,9 @@ const size_t JSON_SIZE = 2048;
 const int TOTAL_ROBOTS = 12;
 
 // ====== TIMING CONSTANTS (누적 오차 방지 방식) ======
-const uint32_t BROADCAST_MIN_INTERVAL_MS = 20;
-const uint32_t BROADCAST_MAX_INTERVAL_MS = 40;
-const uint32_t TCP_MONITORING_INTERVAL_MS = 50;
+const uint32_t BROADCAST_MIN_INTERVAL_MS = 100;
+const uint32_t BROADCAST_MAX_INTERVAL_MS = 100;
+const uint32_t TCP_MONITORING_INTERVAL_MS = 100;
 const uint32_t MEMORY_CLEANUP_INTERVAL_MS = 5000;
 const uint32_t STATS_PRINT_INTERVAL_MS = 5000;
 
@@ -64,8 +64,6 @@ size_t currentMemoryUsage_bytes = 0;
 size_t peakMemoryUsage_bytes = 0;
 
 static char g_jsonBuf[JSON_SIZE];
-
-// ESPNOW 송신 패킷 고정 버퍼
 static uint8_t g_pkt[ESPNOW_MAX_PAYLOAD];
 
 // -------------------------
@@ -118,7 +116,6 @@ bool update_Broadcast_recv_JSON_MAP(const String& senderID, const char* jsonBuf,
     return false;
   }
 
-  // 수신 콜백에서 오래 잠그지 않기: 즉시 락 실패 시 드랍
   if (xSemaphoreTake(mapLock, 0) != pdTRUE) {
     delete doc;
     return false;
@@ -138,9 +135,6 @@ bool update_Broadcast_recv_JSON_MAP(const String& senderID, const char* jsonBuf,
   return true;
 }
 
-// =====================================================
-// Core 3.x 변경: recv callback 시그니처
-// =====================================================
 void onEspNowRecv(const esp_now_recv_info_t *recv_info, const uint8_t *incoming, int len) {
   (void)recv_info;
 
@@ -166,15 +160,12 @@ void ensureBroadcastPeer() {
 
   esp_now_peer_info_t p = {};
   memcpy(p.peer_addr, bcast, 6);
-
-  // Core 3.x에서 권장: 인터페이스/채널 명시
   p.ifidx = WIFI_IF_STA;
-  p.channel = WiFi.channel();   // AP 연결된 채널과 동일해야 함
+  p.channel = WiFi.channel();
   p.encrypt = false;
 
   esp_err_t rc = esp_now_add_peer(&p);
   if (rc != ESP_OK && rc != ESP_ERR_ESPNOW_EXIST) {
-    //Serial.printf("[ESPNOW] add_peer(bcast) failed: %d\n", (int)rc);
   }
 }
 
@@ -196,19 +187,16 @@ void broadcastSelfMessageIfDue() {
 
   ensureBroadcastPeer();
 
-  // JSON 직렬화
   size_t jsonLen = serializeJson(selfMessageDoc, g_jsonBuf, sizeof(g_jsonBuf));
   if (jsonLen == 0) return;
 
   const uint8_t idLen = (uint8_t)SELF_ID.length();
   const size_t total = 1 + (size_t)idLen + jsonLen;
 
-  // v2 payload 한도(1470) 기준으로 체크
   if ((int)total > ESPNOW_MAX_PAYLOAD) {
     return;
   }
 
-  // 고정 버퍼에 패킷 구성 [idLen][id][json]
   g_pkt[0] = idLen;
   memcpy(&g_pkt[1], SELF_ID.c_str(), idLen);
   memcpy(&g_pkt[1 + idLen], g_jsonBuf, jsonLen);
@@ -299,8 +287,6 @@ void printTimingStats() {
 
 void setupNetwork() {
   WiFi.mode(WIFI_STA);
-
-  // 절전/모뎀슬립 비활성화 + 자동 재연결
   WiFi.setSleep(false);
   esp_wifi_set_ps(WIFI_PS_NONE);
   WiFi.setAutoReconnect(true);
@@ -327,7 +313,6 @@ void setupNetwork() {
   Serial.printf("[WiFi] IP Address: %s\n", WiFi.localIP().toString().c_str());
   Serial.printf("[WiFi] Board ID (SELF_ID): %s\n", SELF_ID.c_str());
 
-  // 실제 채널 출력 (ESPNOW는 이 채널과 동일해야 함)
   uint8_t primary = 0;
   wifi_second_chan_t second = WIFI_SECOND_CHAN_NONE;
   esp_wifi_get_channel(&primary, &second);
@@ -335,18 +320,17 @@ void setupNetwork() {
 
   server.begin();
 
-  // ESPNOW init (레거시 C API)
   if (esp_now_init() != ESP_OK) {
     Serial.println("[ESPNOW] init failed -> restart");
     ESP.restart();
   }
 
-  // Core 3.x 콜백 등록
   esp_now_register_recv_cb(onEspNowRecv);
-
   ensureBroadcastPeer();
 
-  Serial.printf("[ESPNOW] Ready. Using max payload=%d (v2 confirmed in your environment)\n", ESPNOW_MAX_PAYLOAD);
+  // Serial.printf("[ESPNOW] Ready. Max payload=%d bytes\n", ESPNOW_MAX_PAYLOAD);
+  // Serial.printf("[CONFIG] JSON_SIZE=%d bytes, Broadcast interval=%d~%dms\n",
+  //               JSON_SIZE, BROADCAST_MIN_INTERVAL_MS, BROADCAST_MAX_INTERVAL_MS);
 }
 
 void setup() {
@@ -371,11 +355,14 @@ void setup() {
   currentBroadcastInterval_ms = random(BROADCAST_MIN_INTERVAL_MS, BROADCAST_MAX_INTERVAL_MS);
 
   setupNetwork();
+  
+  Serial.println("[SYSTEM] Using drift-free timing (누적 오차 방지)");
 }
 
 void loop() {
-  // Wi-Fi 끊김 복구
-    unsigned long loopStart_us = micros();
+  unsigned long loopStart_us = micros();
+
+  // ========== WiFi 재연결 체크 ==========
   if (WiFi.status() != WL_CONNECTED) {
     for (auto &c : clients) c.stop();
     clients.clear();
@@ -384,7 +371,7 @@ void loop() {
     return;
   }
 
-  // 새 클라이언트 수락 (끊긴 슬롯 재사용)
+  // ========== TCP 클라이언트 수락 ==========
   WiFiClient newcomer = server.available();
   if (newcomer) {
     newcomer.setTimeout(10);
@@ -402,15 +389,17 @@ void loop() {
     if (!placed) clients.push_back(newcomer);
   }
 
-  // TCP 데이터 수신 (PC -> ESP32)
+  // ========== TCP 데이터 수신 (PC -> ESP32) ==========
   for (auto &c : clients) {
     if (c && c.connected() && c.available()) {
       String line = c.readStringUntil('\n');
-      (void)deserializeJson(selfMessageDoc, line); // 실패해도 조용히 무시(필요하면 로그 추가)
+      (void)deserializeJson(selfMessageDoc, line);
     }
   }
 
-  // ESPNOW 브로드캐스트
+  // ========== 핵심 작업 (누적 오차 방지 방식) ==========
+  
+  // 1. ESP-NOW 브로드캐스트 (가장 중요!)
   broadcastSelfMessageIfDue();
   
   // 2. TCP 모니터링 송신
