@@ -21,12 +21,43 @@ const char* SSID       = "Your SSID";
 const char* PASSWORD   = "Your Password";
 const String SELF_ID   = "11";           // Change this for each robot (0-11)
 const uint16_t TCP_PORT = 8080;
-const uint16_t UDP_PORT = 8080;
+const int UDP_PORT = 8080;  // UDP: PC → ESP32 이동 명령 (TCP와 프로토콜 달라 포트 공유 가능)
 
 // JSON buffer size
 const size_t JSON_SIZE = 2048;
 
-// ===================== 상태 정의 =====================
+WiFiServer tcpServer(TCP_PORT);
+std::vector<WiFiClient> clients;
+
+DynamicJsonDocument selfMessageDoc(JSON_SIZE);
+std::map<String, DynamicJsonDocument*> receivedJSON_MAP;
+std::map<String, unsigned long> CommRecvTime_MAP;
+SemaphoreHandle_t mapLock;
+
+unsigned long lastBroadcast_ms       = 0;
+unsigned long lastTcpSend_ms         = 0;
+unsigned long lastMemoryCleanup_ms   = 0;
+unsigned long lastStatsPrint_ms      = 0;
+
+unsigned long p2p_loopCount        = 0;
+unsigned long p2p_maxLoopTime_us   = 0;
+unsigned long p2p_minLoopTime_us   = 999999;
+unsigned long p2p_totalLoopTime_us = 0;
+
+size_t currentMemoryUsage_bytes = 0;
+size_t peakMemoryUsage_bytes    = 0;
+
+static char    g_jsonBuf[JSON_SIZE];
+
+// ============================================================
+// ====== Puppet Config (Core 0 - puppetTask) =================
+// ====== UDP 이동 명령 수신, 모터/IR/엔코더 제어 =============
+// ============================================================
+
+WiFiUDP udp;
+char packetBuffer[255];
+
+// --- 상태 머신 ---
 enum RobotState {
   STATE_IDLE,
   STATE_TURNING,
@@ -35,21 +66,24 @@ enum RobotState {
   STATE_ESCAPING,
   STATE_EMERGENCY
 };
-RobotState state = STATE_IDLE;
+volatile RobotState state = STATE_IDLE;
 
-// ESP-NOW settings
-const int TOTAL_ROBOTS = 12;
-const uint32_t MIN_BROADCAST_MS = 50;
-const uint32_t MAX_BROADCAST_MS = 100;
+const uint32_t BROADCAST_MIN_INTERVAL_MS  = 100;
+const uint32_t BROADCAST_MAX_INTERVAL_MS  = 100;
 const uint32_t PEER_LINK_DROP_MS = 900;
 const uint32_t WIFI_RECONNECT_INTERVAL_MS = 300;
 const uint32_t WIFI_TIMEOUT_MS = 10000;
 const uint32_t WIFI_RETRY_DELAY_MS = 200;
-const uint32_t MONITORING_SEND_INTERVAL_MS = 50;
-const uint32_t INITIAL_BROADCAST_INTERVAL_MS = 40;
+const uint32_t TCP_MONITORING_INTERVAL_MS = 100;
+const uint32_t MEMORY_CLEANUP_INTERVAL_MS = 5000;
+const uint32_t STATS_PRINT_INTERVAL_MS    = 5000;
 const uint32_t SERIAL_STABILIZE_DELAY_MS = 1000;
 
 static const int ESPNOW_MAX_PAYLOAD = 1470;
+
+uint32_t currentBroadcastInterval_ms = BROADCAST_MIN_INTERVAL_MS;
+static uint8_t g_pkt[ESPNOW_MAX_PAYLOAD];
+const uint32_t Peer_LinkDrop_MS           = 900;
 
 
 // 펄스/제어 상수
@@ -76,8 +110,10 @@ static const float ROTATION_DEADBAND_DEG = 5.0f;    // 미세 회전 무시 각�
 static const int   MIN_MOTOR_PWM         = 60;      // 모터 구동 최소 출력
 
 // PI 제어 게인 (주행 보정)
-static const float K_P = 0.95f;  // 비례 게인
-static const float K_I = 0.01f;  // 적분 게인
+static const float K_P = 0.5f;
+static const float K_I = 0.002f;
+static const float INTEGRAL_LIMIT = 500.0f;
+static const int   ERROR_DEADBAND = 5;
 
 // 비상 동작 속도
 static const int EMERGENCY_SPIN_SPD = 200;
@@ -97,40 +133,9 @@ unsigned long oscillation_timer_start = 0;
 unsigned long emergency_back_until = 0;
 unsigned long emergency_spin_until = 0;
 
-// ===== Network (Core 0) =====
-WiFiServer tcpServer(TCP_PORT);
-WiFiUDP udp;
-std::vector<WiFiClient> tcpClients;
-
-// ===== CBBA Communication (Core 0) =====
-DynamicJsonDocument selfMessageDoc(JSON_SIZE);
-std::map<String, String> receivedJSON_MAP;
-std::map<String, unsigned long> CommRecvTime_MAP;
-SemaphoreHandle_t mapLock;
-SemaphoreHandle_t selfMsgLock;  // NEW: selfMessageDoc 보호
-
-unsigned long lastBroadcast = 0;
-volatile bool dirtySelf = false;
-volatile bool dirtyNeighbors = false;
-
-// ===== ESP-NOW counters =====
-volatile uint32_t espnow_rx_bytes = 0;
-volatile uint32_t espnow_tx_bytes = 0;
-
-// Global JSON buffer
-static char g_jsonBuf[JSON_SIZE];
-static uint8_t g_pkt[ESPNOW_MAX_PAYLOAD];
-
-// ===== Motion Control (Core 1) - Atomic variables for cross-core sharing =====
-volatile float targetAngleDeg = 0;
-volatile float targetDistMm = 0;
-volatile bool newMotionCommand = false;  // Core 0 → Core 1 signal
-volatile bool stopRequested = false;
-
 volatile long left_encoder_count  = 0;
 volatile long right_encoder_count = 0;
 
-// Core 3.x에서는 인터럽트 핸들러에 IRAM_ATTR이 필수입니다.
 void IRAM_ATTR isr_left_encoder()  { left_encoder_count++; }
 void IRAM_ATTR isr_right_encoder() { right_encoder_count++; }
 
@@ -140,80 +145,30 @@ static long  target_turn_pulses = 0;
 static long  target_move_pulses = 0;
 static float integral_error = 0.0f;
 
-TaskHandle_t commTaskHandle = NULL;
-TaskHandle_t motionTaskHandle = NULL;
+// --- 제어 주기 ---
+static const unsigned long CONTROL_INTERVAL_MS    = 5;    // 5ms 이동 제어
+static const unsigned long LED_UPDATE_INTERVAL_MS = 100;  // 100ms LED 갱신
 
-static inline void clear_motion_targets() {
-  target_turn_pulses = 0;
-  target_move_pulses = 0;
-  start_left_count  = left_encoder_count;
-  start_right_count = right_encoder_count;
-  integral_error = 0.0f;
-}
+// Puppet 태스크 핸들
+TaskHandle_t puppetTaskHandle = NULL;
 
-static inline void enter_escaping(uint16_t ms = ESCAPING_MS) {
-  escaping_until_ms = millis() + ms;
-  Motors_forward(FWD_SPD);
-  state = STATE_ESCAPING;
-}
+// ====== P2P 함수들 ==========================================
 
-static inline void start_emergency_left_spin() {
-  unsigned long now = millis();
-  emergency_back_until = now + BACK_MS;
-  emergency_spin_until = emergency_back_until + EMERGENCY_SPIN_MS;
-
-  Motors_backward(FWD_SPD);
-  state = STATE_EMERGENCY;
-
-  turn_change_count = 0;
-  last_turn_direction = -1;
-  oscillation_timer_start = now;
-
-  Serial.println("[EMERGENCY] back -> spin_left");
-}
-
-static inline void check_oscillation_and_escape(int current_direction) {
-  if (last_turn_direction != 0 && current_direction != last_turn_direction) {
-    unsigned long now = millis();
-    if (now - oscillation_timer_start > OSCILLATION_WINDOW_MS) {
-      turn_change_count = 1;
-      oscillation_timer_start = now;
-    } else {
-      turn_change_count++;
-    }
-
-    if (turn_change_count >= OSCILLATION_COUNT_THRESHOLD) {
-      start_emergency_left_spin();
-      return;
-    }
-  }
-  last_turn_direction = current_direction;
-}
-
-// =============================================================================
-// ESP-NOW COMMUNICATION (Core 0)
-// =============================================================================
 bool update_Broadcast_recv_JSON_MAP(const String& senderID, const char* jsonBuf, size_t jsonLen) {
-  if (jsonLen < 2) return false;
+  DynamicJsonDocument* doc = new DynamicJsonDocument(JSON_SIZE);
+  if (deserializeJson(*doc, jsonBuf, jsonLen)) { delete doc; return false; }
 
-  // 콜백에서 풀 파싱은 부담 큼 -> 아주 가벼운 형태 체크만
-  const char first = jsonBuf[0];
-  const char last  = jsonBuf[jsonLen - 1];
-  if (!((first == '{' && last == '}') || (first == '[' && last == ']'))) {
-    return false;
+  // 콜백(인터럽트 컨텍스트)에서 오래 블록하지 않도록 즉시 실패 허용
+  if (xSemaphoreTake(mapLock, 0) != pdTRUE) { delete doc; return false; }
+
+  auto it = receivedJSON_MAP.find(senderID);
+  if (it != receivedJSON_MAP.end()) {
+    delete it->second;
+    it->second = doc;
+  } else {
+    receivedJSON_MAP[senderID] = doc;
+    currentMemoryUsage_bytes += JSON_SIZE;
   }
-
-  // 수신 콜백에서 오래 잠그지 않기: 즉시 락 실패 시 드랍
-  if (xSemaphoreTake(mapLock, 0) != pdTRUE) {
-    return false;
-  }
-
-  // 기존 String capacity 재사용(힙 단편화 완화)
-  String& dst = receivedJSON_MAP[senderID];
-  dst.remove(0);
-  dst.reserve(jsonLen + 1);
-  dst.concat(jsonBuf, jsonLen);
-
   CommRecvTime_MAP[senderID] = millis();
   xSemaphoreGive(mapLock);
   return true;
@@ -231,11 +186,7 @@ void onEspNowRecv(const esp_now_recv_info_t *recv_info, const uint8_t *incoming,
 
   int jsonLen = len - (1 + idLen);
   if (jsonLen <= 0) return;
-
-  if (update_Broadcast_recv_JSON_MAP(senderID, (const char*)(&incoming[1 + idLen]), (size_t)jsonLen)) {
-    espnow_rx_bytes += (uint32_t)len;
-    dirtyNeighbors = true;
-  }
+  update_Broadcast_recv_JSON_MAP(senderID, (const char*)(&incoming[1 + idLen]), (size_t)jsonLen);
 }
 
 void ensureBroadcastPeer() {
@@ -252,30 +203,19 @@ void ensureBroadcastPeer() {
 }
 
 void broadcastSelfMessageIfDue() {
-  static uint32_t nextInterval = 40;
-  if (millis() - lastBroadcast < nextInterval) return;
+  unsigned long now = millis();
+  if ((unsigned long)(now - lastBroadcast_ms) < currentBroadcastInterval_ms) return;
+  lastBroadcast_ms += currentBroadcastInterval_ms;
+  currentBroadcastInterval_ms = random(BROADCAST_MIN_INTERVAL_MS, BROADCAST_MAX_INTERVAL_MS);
 
-  lastBroadcast = millis();
-  nextInterval = random(MIN_BROADCAST_MS, MAX_BROADCAST_MS);
-
-  // Lock selfMessageDoc for reading
-  if (xSemaphoreTake(selfMsgLock, pdMS_TO_TICKS(5)) != pdTRUE) return;
-  
-  if (selfMessageDoc.isNull() || selfMessageDoc.size() == 0) {
-    xSemaphoreGive(selfMsgLock);
-    return;
-  }
-
+  if (selfMessageDoc.isNull()) return;
   ensureBroadcastPeer();
 
   size_t jsonLen = serializeJson(selfMessageDoc, g_jsonBuf, sizeof(g_jsonBuf));
-  xSemaphoreGive(selfMsgLock);
-  
   if (jsonLen == 0) return;
 
-  uint8_t idLen = (uint8_t)SELF_ID.length();
-  size_t total = 1 + (size_t)idLen + jsonLen;
-
+  const uint8_t idLen = (uint8_t)SELF_ID.length();
+  const size_t total  = 1 + (size_t)idLen + jsonLen;
   if ((int)total > ESPNOW_MAX_PAYLOAD) return;
 
   g_pkt[0] = idLen;
@@ -284,171 +224,144 @@ void broadcastSelfMessageIfDue() {
 
   uint8_t bcast[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
   esp_now_send(bcast, g_pkt, total);
-  espnow_tx_bytes += (uint32_t)total;
 }
 
-// =============================================================================
-// TCP COMMUNICATION (Core 0)
-// =============================================================================
-void handleTcpClients() {
-  WiFiClient newcomer = tcpServer.available();
-  if (newcomer) {
-    newcomer.setTimeout(10);
-    newcomer.setNoDelay(true);
+void sendTcpMonitoringIfDue() {
+  unsigned long now = millis();
+  if ((unsigned long)(now - lastTcpSend_ms) < TCP_MONITORING_INTERVAL_MS) return;
+  lastTcpSend_ms += TCP_MONITORING_INTERVAL_MS;
 
-    bool placed = false;
-    for (auto &c : tcpClients) {
-      if (!c || !c.connected()) {
-        c.stop();
-        c = newcomer;
-        placed = true;
-        break;
-      }
-    }
-    if (!placed) tcpClients.push_back(newcomer);
+  size_t activeRobots = receivedJSON_MAP.size();
+  size_t monitorSize  = JSON_SIZE * (activeRobots + 1);
+  DynamicJsonDocument monitor(monitorSize);
+  monitor["agent_id"] = SELF_ID;
+  JsonObject rx = monitor.createNestedObject("received_messages");
+
+  xSemaphoreTake(mapLock, portMAX_DELAY);
+  for (auto const& kv : receivedJSON_MAP) {
+    if ((unsigned long)(now - CommRecvTime_MAP[kv.first]) <= Peer_LinkDrop_MS)
+      rx[kv.first] = kv.second->as<JsonObject>();
   }
-
-  for (auto &c : tcpClients) {
-    if (c && c.connected() && c.available()) {
-      String line = c.readStringUntil('\n');
-      
-      // Lock selfMessageDoc for writing
-      if (xSemaphoreTake(selfMsgLock, pdMS_TO_TICKS(10)) == pdTRUE) {
-        if (deserializeJson(selfMessageDoc, line) == DeserializationError::Ok) {
-          dirtySelf = true;
-        }
-        xSemaphoreGive(selfMsgLock);
-      }
-    }
-  }
-}
-
-void sendMonitorToTcpClients() {
-  static unsigned long lastTcpSend = 0;
-  if (millis() - lastTcpSend < 50) return;
-
-  // [FIX #1] 큰 DynamicJsonDocument 제거:
-  // mapLock을 짧게 잡고 스냅샷만 뜬 뒤, 락 풀고 String으로 한 줄 JSON 구성
-  std::vector<std::pair<String, String>> snapshot;
-  snapshot.reserve(16);
-
-  const unsigned long now = millis();
-
-  if (xSemaphoreTake(mapLock, pdMS_TO_TICKS(5)) == pdTRUE) {
-    for (auto const &kv : receivedJSON_MAP) {
-      auto itT = CommRecvTime_MAP.find(kv.first);
-      if (itT != CommRecvTime_MAP.end() && (now - itT->second <= PEER_LINK_DROP_MS)) {
-        snapshot.push_back({kv.first, kv.second}); // (senderID, raw json)
-      }
-    }
-    xSemaphoreGive(mapLock);
-  }
-
-  // 한 줄 JSON: {"agent_id":"11","received_messages":{"03":{...},"04":{...}}}
-  size_t est = 64;
-  for (auto &kv : snapshot) est += 6 + kv.first.length() + kv.second.length();
+  xSemaphoreGive(mapLock);
 
   String out;
-  out.reserve(est);
-  out += "{\"agent_id\":\"";
-  out += SELF_ID;
-  out += "\",\"received_messages\":{";
+  serializeJson(monitor, out);
+  out += "\n";
+  for (auto& c : clients)
+    if (c && c.connected()) c.print(out);
 
-  bool first = true;
-  for (auto &kv : snapshot) {
-    if (!first) out += ",";
-    first = false;
-
-    out += "\"";
-    out += kv.first;
-    out += "\":";
-    out += kv.second; // raw JSON object/array
-  }
-
-  out += "}}\n";
-
-  for (auto &c : tcpClients) {
-    if (c && c.connected()) {
-      c.print(out);
-    }
-  }
-
-  dirtySelf = dirtyNeighbors = false;
-  lastTcpSend = millis();
-
-  // Cleanup disconnected clients
-  for (auto &c : tcpClients) {
-    if (c && !c.connected()) c.stop();
-  }
-  tcpClients.erase(std::remove_if(tcpClients.begin(), tcpClients.end(),
-    [](WiFiClient& c) { return !c.connected(); }), tcpClients.end());
+  size_t tempMem = currentMemoryUsage_bytes + monitorSize;
+  if (tempMem > peakMemoryUsage_bytes) peakMemoryUsage_bytes = tempMem;
 }
 
-// =============================================================================
-// UDP MOTION COMMANDS (Core 0 receives, Core 1 executes)
-// =============================================================================
-void handleUdpPacket() {
-  static char udpBuffer[256];
-  
-  int packetSize = udp.parsePacket();
-  if (!packetSize) return;
+void cleanupStaleEntries() {
+  unsigned long now = millis();
+  if ((unsigned long)(now - lastMemoryCleanup_ms) < MEMORY_CLEANUP_INTERVAL_MS) return;
+  lastMemoryCleanup_ms += MEMORY_CLEANUP_INTERVAL_MS;
 
-  // Keep only latest packet
-  while (packetSize) {
-    int len = udp.read(udpBuffer, 255);
-    if (len > 0) udpBuffer[len] = 0;
-    packetSize = udp.parsePacket();
+  xSemaphoreTake(mapLock, portMAX_DELAY);
+  auto it = receivedJSON_MAP.begin();
+  int cleaned = 0;
+  while (it != receivedJSON_MAP.end()) {
+    if ((unsigned long)(now - CommRecvTime_MAP[it->first]) > (Peer_LinkDrop_MS * 2)) {
+      delete it->second;
+      CommRecvTime_MAP.erase(it->first);
+      it = receivedJSON_MAP.erase(it);
+      currentMemoryUsage_bytes -= JSON_SIZE;
+      cleaned++;
+    } else { ++it; }
   }
+  xSemaphoreGive(mapLock);
 
-  // STOP command
-  if (strncasecmp(udpBuffer, "STOP", 4) == 0) {
-    stopRequested = true;
-    return;
-  }
+  if (cleaned > 0)
+    Serial.printf("[P2P][MEM] Cleaned %d stale entries, current: %d bytes\n",
+                  cleaned, currentMemoryUsage_bytes);
+}
 
-  // G command: "G <angle> <distance>"
-  if (udpBuffer[0] == 'G' || udpBuffer[0] == 'g') {
-    float angle = 0, dist = 0;
-    if (sscanf(udpBuffer + 1, "%f %f", &angle, &dist) == 2) {
-      if (dist >= MIN_DIST_MM) {
-        targetAngleDeg = angle;
-        targetDistMm = dist;
-        newMotionCommand = true;  // Signal to Core 1
-      }
+void printTimingStats() {
+  unsigned long now = millis();
+  if ((unsigned long)(now - lastStatsPrint_ms) < STATS_PRINT_INTERVAL_MS) return;
+  lastStatsPrint_ms += STATS_PRINT_INTERVAL_MS;
+  if (p2p_loopCount == 0) return;
+
+  unsigned long avg    = p2p_totalLoopTime_us / p2p_loopCount;
+  unsigned long jitter = p2p_maxLoopTime_us - p2p_minLoopTime_us;
+  Serial.printf("[P2P][TIMING] Loops:%lu Avg:%lu us Jitter:%lu us ActiveRobots:%d\n",
+                p2p_loopCount, avg, jitter, receivedJSON_MAP.size());
+  Serial.printf("[P2P][MEM] Current:%d Peak:%d bytes\n",
+                currentMemoryUsage_bytes, peakMemoryUsage_bytes);
+
+  p2p_loopCount = p2p_totalLoopTime_us = 0;
+  p2p_maxLoopTime_us = 0;
+  p2p_minLoopTime_us = 999999;
+}
+
+// ============================================================
+// ====== Puppet 함수들 =======================================
+// ============================================================
+
+static inline void clear_motion_targets() {
+  target_turn_pulses = 0;
+  target_move_pulses = 0;
+  start_left_count   = left_encoder_count;
+  start_right_count  = right_encoder_count;
+  integral_error     = 0.0f;
+}
+
+static inline void enter_escaping(uint16_t ms = ESCAPING_MS) {
+  escaping_until_ms = millis() + ms;
+  Motors_forward(FWD_SPD);
+  state = STATE_ESCAPING;
+}
+
+static inline void start_emergency_left_spin() {
+  unsigned long now    = millis();
+  emergency_back_until = now + BACK_MS;
+  emergency_spin_until = emergency_back_until + EMERGENCY_SPIN_MS;
+  Motors_backward(FWD_SPD);
+  state = STATE_EMERGENCY;
+  turn_change_count = 0;
+  last_turn_direction = -1;
+  oscillation_timer_start = now;
+  Serial.println("[Puppet][EMERGENCY] back -> spin_left");
+}
+
+static inline void check_oscillation_and_escape(int dir) {
+  if (last_turn_direction != 0 && dir != last_turn_direction) {
+    unsigned long now = millis();
+    if (now - oscillation_timer_start > OSCILLATION_WINDOW_MS) {
+      turn_change_count = 1;
+      oscillation_timer_start = now;
+    } else { turn_change_count++; }
+    if (turn_change_count >= OSCILLATION_COUNT_THRESHOLD) {
+      start_emergency_left_spin(); return;
     }
+  }
+  last_turn_direction = dir;
+}
+
+void pi_control(long l_now, long r_now, int* left_pwm, int* right_pwm) {
+  long err = l_now - r_now;
+  if (abs(err) < ERROR_DEADBAND) err = 0;
+  integral_error += (float)err;
+  if (integral_error >  INTEGRAL_LIMIT) integral_error =  INTEGRAL_LIMIT;
+  if (integral_error < -INTEGRAL_LIMIT) integral_error = -INTEGRAL_LIMIT;
+  float u = (K_P * (float)err) + (K_I * integral_error);
+  *left_pwm  = constrain((int)lroundf(FWD_SPD - u), MIN_MOTOR_PWM, 255);
+  *right_pwm = constrain((int)lroundf(FWD_SPD + u), MIN_MOTOR_PWM, 255);
+}
+
+void update_status_led() {
+  switch (state) {
+    case STATE_IDLE:      Set_LED(1, 0, 30,  0); Set_LED(2, 0, 30,  0); break;
+    case STATE_TURNING:   Set_LED(1, 0,  0, 50); Set_LED(2, 0,  0, 50); break;
+    case STATE_MOVING:    Set_LED(1, 0, 50,  0); Set_LED(2, 0, 50,  0); break;
+    case STATE_AVOID:     Set_LED(1,50, 50,  0); Set_LED(2,50, 50,  0); break;
+    case STATE_ESCAPING:  Set_LED(1,50, 25,  0); Set_LED(2,50, 25,  0); break;
+    case STATE_EMERGENCY: Set_LED(1,50,  0,  0); Set_LED(2,50,  0,  0); break;
   }
 }
 
-// =============================================================================
-// COMMUNICATION TASK (Core 0) - HIGH PRIORITY
-// =============================================================================
-void commTask(void* parameter) {
-  Serial.println("[Core 0] Communication task started");
-  
-  for (;;) {
-    // WiFi reconnection
-    if (WiFi.status() != WL_CONNECTED) {
-      for (auto &c : tcpClients) c.stop();
-      tcpClients.clear();
-      WiFi.reconnect();
-      vTaskDelay(pdMS_TO_TICKS(100));
-      continue;
-    }
-
-    // ===== All communication handling =====
-    handleTcpClients();           // TCP: PC <-> Robot
-    broadcastSelfMessageIfDue();  // ESP-NOW: Robot <-> Robot
-    sendMonitorToTcpClients();    // Send monitor to PC
-    handleUdpPacket();            // UDP: Motion commands
-
-    // Short delay to prevent watchdog trigger
-    vTaskDelay(pdMS_TO_TICKS(1));
-  }
-}
-
-// =============================================================================
-// MOTION CONTROL TASK (Core 1) - INDEPENDENT
-// =============================================================================
 void start_motion(float angle_deg, float dist_mm) {
   if (state == STATE_AVOID || state == STATE_ESCAPING || state == STATE_EMERGENCY) {
     return;
@@ -470,6 +383,35 @@ void start_motion(float angle_deg, float dist_mm) {
   } else {
     state = STATE_IDLE;
     Motors_stop();
+  }
+}
+
+void handle_udp_packet() {
+  int packetSize = udp.parsePacket();
+  if (!packetSize) return;
+
+  // 가장 최신 패킷만 사용 (버퍼 플러시)
+  while (packetSize) {
+    int len = udp.read(packetBuffer, 255);
+    if (len > 0) packetBuffer[len] = 0;
+    packetSize = udp.parsePacket();
+  }
+
+  if (strncasecmp(packetBuffer, "STOP", 4) == 0) {
+    Motors_stop(); clear_motion_targets(); state = STATE_IDLE; return;
+  }
+
+  if (packetBuffer[0] == 'G' || packetBuffer[0] == 'g') {
+    float angle = 0, dist = 0;
+    if (sscanf(packetBuffer + 1, "%f %f", &angle, &dist) == 2) {
+      if (dist < MIN_DIST_MM) return;
+      if (state == STATE_MOVING) {
+        long l_now = labs(left_encoder_count - start_left_count);
+        long r_now = labs(right_encoder_count - start_right_count);
+        if (((l_now + r_now) / 2) < UPDATE_THRESHOLD_PULSES) return;
+      }
+      start_motion(angle, dist);
+    }
   }
 }
 
@@ -523,13 +465,10 @@ void control_loop(int r1, int r2, int r3, int r4, int r5) {
         Motors_stop();
         state = STATE_IDLE;
       } else {
-        long err = l_now - r_now;
-        integral_error += err;
-        float u = (K_P * (float)err) + (K_I * (float)integral_error);
-        int left_pwm  = constrain((int)lroundf(FWD_SPD - u), MIN_MOTOR_PWM, 255);
-        int right_pwm = constrain((int)lroundf(FWD_SPD + u), MIN_MOTOR_PWM, 255);
-        Left_mot_forward(left_pwm);
-        Right_mot_forward(right_pwm);
+        int lp, rp;
+        pi_control(l_now, r_now, &lp, &rp);
+        Left_mot_forward(lp);
+        Right_mot_forward(rp);
       }
       break;
 
@@ -571,45 +510,39 @@ void control_loop(int r1, int r2, int r3, int r4, int r5) {
   }
 }
 
-void motionTask(void* parameter) {
-  Serial.println("[Core 1] Motion control task started");
-  
-  for (;;) {
-    // Check for STOP command from Core 0
-    if (stopRequested) {
-      Motors_stop();
-      clear_motion_targets();
-      state = STATE_IDLE;
-      stopRequested = false;
+
+// ============================================================
+// ====== Core 0: Puppet 태스크 ===============================
+// ============================================================
+void puppetTask(void* parameter) {
+  // UDP 시작 (setup()에서 WiFi 연결 완료 후 이 태스크가 시작되므로 안전)
+  udp.begin(UDP_PORT);
+  Serial.printf("[Puppet][Core0] UDP server started on port %d\n", UDP_PORT);
+
+  unsigned long last_control_time = 0;
+  unsigned long last_led_update   = 0;
+
+  while (true) {
+    unsigned long now = millis();
+
+    // UDP 명령 처리 (G command / STOP)
+    handle_udp_packet();
+
+    // 이동 제어 (5ms 주기)
+    if (now - last_control_time >= CONTROL_INTERVAL_MS) {
+      last_control_time = now;
+      int r1 = Get_IR(1), r2 = Get_IR(2), r3 = Get_IR(3);
+      int r4 = Get_IR(4), r5 = Get_IR(5);
+      control_loop(r1, r2, r3, r4, r5);
     }
 
-    // Check for new motion command from Core 0
-    if (newMotionCommand) {
-      // Only accept if not in obstacle avoidance
-      if (state == STATE_MOVING) {
-        long l_now = labs(left_encoder_count - start_left_count);
-        long r_now = labs(right_encoder_count - start_right_count);
-        if (((l_now + r_now) / 2) >= UPDATE_THRESHOLD_PULSES) {
-          start_motion(targetAngleDeg, targetDistMm);
-        }
-      } else if (state == STATE_IDLE || state == STATE_TURNING) {
-        start_motion(targetAngleDeg, targetDistMm);
-      }
-      newMotionCommand = false;
+    // LED 갱신 (100ms 주기)
+    if (now - last_led_update >= LED_UPDATE_INTERVAL_MS) {
+      last_led_update = now;
+      update_status_led();
     }
 
-    // Read IR sensors (this is slow, but doesn't block Core 0 now!)
-    int r1 = Get_IR(1);
-    int r2 = Get_IR(2);
-    int r3 = Get_IR(3);
-    int r4 = Get_IR(4);
-    int r5 = Get_IR(5);
-
-    // Run motion control
-    control_loop(r1, r2, r3, r4, r5);
-
-    // Motion task runs at ~50Hz (20ms period)
-    vTaskDelay(pdMS_TO_TICKS(50));
+    vTaskDelay(pdMS_TO_TICKS(1));  // 1ms yield → 다른 태스크에 CPU 양보
   }
 }
 
@@ -638,10 +571,8 @@ void setupNetwork() {
       Serial.print("[WiFi] Connecting to AP");
     }
   }
-
-  Serial.println("\n[WiFi] Connected!");
-  Serial.printf("[WiFi] IP Address: %s\n", WiFi.localIP().toString().c_str());
-  Serial.printf("[WiFi] Board ID (SELF_ID): %s\n", SELF_ID.c_str());
+  Serial.printf("\n[WiFi] Connected: %s\n", WiFi.localIP().toString().c_str());
+  Serial.printf("[WiFi] SELF_ID: %s\n", SELF_ID.c_str());
 
   // 실제 채널 출력 (ESPNOW는 이 채널과 동일해야 함)
   uint8_t primary = 0;
@@ -653,17 +584,10 @@ void setupNetwork() {
   tcpServer.begin();
   Serial.printf("[TCP] Server on port %d\n", TCP_PORT);
 
-  // Start UDP
-  udp.begin(UDP_PORT);
-  Serial.printf("[UDP] Server on port %d\n", UDP_PORT);
-
-  // Initialize ESP-NOW
   if (esp_now_init() != ESP_OK) {
     Serial.println("[ESPNOW] init failed -> restart");
     ESP.restart();
   }
-
-  // Core 3.x 콜백 등록
   esp_now_register_recv_cb(onEspNowRecv);
 
   ensureBroadcastPeer();
@@ -677,9 +601,18 @@ void setup() {
 
   randomSeed(esp_random());
   mapLock = xSemaphoreCreateMutex();
-  selfMsgLock = xSemaphoreCreateMutex();
 
-  // Initialize Mona robot hardware
+  // P2P 타이밍/메모리 초기화
+  currentMemoryUsage_bytes     = JSON_SIZE;  // selfMessageDoc 크기
+  peakMemoryUsage_bytes        = JSON_SIZE;
+  unsigned long now            = millis();
+  lastBroadcast_ms             = now;
+  lastTcpSend_ms               = now;
+  lastMemoryCleanup_ms         = now;
+  lastStatsPrint_ms            = now;
+  currentBroadcastInterval_ms  = random(BROADCAST_MIN_INTERVAL_MS, BROADCAST_MAX_INTERVAL_MS);
+
+  // MONA 하드웨어 초기화 (Puppet용)
   Mona_ESP_init();
 
   // Setup encoders
@@ -687,40 +620,86 @@ void setup() {
   pinMode(PIN_ENCODER_RIGHT, INPUT);
   attachInterrupt(digitalPinToInterrupt(PIN_ENCODER_LEFT), isr_left_encoder, RISING);
   attachInterrupt(digitalPinToInterrupt(PIN_ENCODER_RIGHT), isr_right_encoder, RISING);
+  Set_LED(1, 0, 30, 0);
+  Set_LED(2, 0, 30, 0);
 
   setupNetwork();
 
-  Serial.println("=================================");
-  Serial.println("MONA Firmware v2 - Dual Core");
-  Serial.println("- Core 0: Communication (TCP/ESP-NOW/UDP)");
-  Serial.println("- Core 1: Motion Control (IR/Motors)");
-  Serial.println("=================================");
-
-  // Create Communication Task on Core 0 (PRO_CPU)
-  // Higher priority (2) than default Arduino loop
+// ====== Core 1: puppet loop() ==================================
   xTaskCreatePinnedToCore(
-    commTask,           // Task function
-    "CommTask",         // Name
-    8192,               // Stack size
-    NULL,               // Parameters
-    2,                  // Priority (higher = more important)
-    &commTaskHandle,    // Task handle
-    0                   // Core 0
+    puppetTask,        // 태스크 함수
+    "PuppetTask",      // 태스크 이름
+    8192,              // 스택 크기 (bytes)
+    NULL,              // 파라미터
+    2,                 // 우선순위 (loop()의 1보다 높게 → 모터 제어 우선)
+    &puppetTaskHandle, // 태스크 핸들
+    0                  // Core 0 고정
   );
 
-  // Create Motion Task on Core 1 (APP_CPU)
-  // Lower priority (1), independent from communication
-  xTaskCreatePinnedToCore(
-    motionTask,         // Task function
-    "MotionTask",       // Name
-    4096,               // Stack size
-    NULL,               // Parameters
-    1,                  // Priority
-    &motionTaskHandle,  // Task handle
-    1                   // Core 1
-  );
+  Serial.println("[SYSTEM] Dual-core ready!");
+  Serial.println("[SYSTEM]   Core 0 → Puppet (UDP motion control)");
+  Serial.println("[SYSTEM]   Core 1 → P2P   (ESP-NOW + TCP CBBA)");
 }
 
+// ====== Core 1: P2P loop() ==================================
 void loop() {
-  vTaskDelay(pdMS_TO_TICKS(1000));
+  unsigned long loopStart_us = micros();
+
+  // WiFi 재연결 체크
+  if (WiFi.status() != WL_CONNECTED) {
+    for (auto& c : clients) c.stop();
+    clients.clear();
+    WiFi.reconnect();
+    yield(); return;
+  }
+
+  // TCP 클라이언트 수락
+  WiFiClient newcomer = tcpServer.available();
+  if (newcomer) {
+    newcomer.setTimeout(10);
+    newcomer.setNoDelay(true);
+    bool placed = false;
+    for (auto& c : clients) {
+      if (!c || !c.connected()) { c.stop(); c = newcomer; placed = true; break; }
+    }
+    if (!placed) clients.push_back(newcomer);
+  }
+
+  // TCP 수신: PC → selfMessageDoc (CBBA 데이터)
+  for (auto& c : clients) {
+    if (c && c.connected() && c.available()) {
+      String line = c.readStringUntil('\n');
+      (void)deserializeJson(selfMessageDoc, line);
+    }
+  }
+
+  // 1. ESP-NOW 브로드캐스트 (100ms 주기)
+  broadcastSelfMessageIfDue();
+
+  // 2. TCP 모니터링 송신 (50ms 주기)
+  sendTcpMonitoringIfDue();
+
+  // 3. 메모리 정리 (5000ms 주기)
+  cleanupStaleEntries();
+
+  // 4. 통계 출력 (5000ms 주기)
+  printTimingStats();
+
+  // TCP 클라이언트 정리
+  for (auto& c : clients)
+    if (c && !c.connected()) c.stop();
+  clients.erase(
+    std::remove_if(clients.begin(), clients.end(),
+                   [](WiFiClient& c){ return !c.connected(); }),
+    clients.end()
+  );
+
+  // 루프 시간 측정
+  unsigned long dur = micros() - loopStart_us;
+  p2p_loopCount++;
+  p2p_totalLoopTime_us += dur;
+  if (dur > p2p_maxLoopTime_us) p2p_maxLoopTime_us = dur;
+  if (dur < p2p_minLoopTime_us) p2p_minLoopTime_us = dur;
+
+  yield();
 }
