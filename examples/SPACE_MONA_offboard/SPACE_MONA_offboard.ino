@@ -17,11 +17,11 @@
 #include <freertos/task.h>
 
 // ====== USER CONFIG ======
-const char* SSID       = "Your SSID";
-const char* PASSWORD   = "Your Password";
-const String SELF_ID   = "11";           // Change this for each robot (0-11)
+const char* SSID        = "Your SSID";
+const char* PASSWORD    = "Your Password";
+const String SELF_ID    = "11";           // Change this for each robot (0-11)
 const uint16_t TCP_PORT = 8080;
-const int UDP_PORT = 8080;  // UDP: PC → ESP32 이동 명령 (TCP와 프로토콜 달라 포트 공유 가능)
+const int UDP_PORT      = 8080;  // UDP: PC → ESP32 이동 명령 (TCP와 프로토콜 달라 포트 공유 가능)
 
 // JSON buffer size
 const size_t JSON_SIZE = 2048;
@@ -39,13 +39,13 @@ unsigned long lastTcpSend_ms         = 0;
 unsigned long lastMemoryCleanup_ms   = 0;
 unsigned long lastStatsPrint_ms      = 0;
 
-unsigned long p2p_loopCount        = 0;
-unsigned long p2p_maxLoopTime_us   = 0;
-unsigned long p2p_minLoopTime_us   = 999999;
-unsigned long p2p_totalLoopTime_us = 0;
+unsigned long p2p_loopCount          = 0;
+unsigned long p2p_maxLoopTime_us     = 0;
+unsigned long p2p_minLoopTime_us     = 999999;
+unsigned long p2p_totalLoopTime_us   = 0;
 
-size_t currentMemoryUsage_bytes = 0;
-size_t peakMemoryUsage_bytes    = 0;
+size_t currentMemoryUsage_bytes      = 0;
+size_t peakMemoryUsage_bytes         = 0;
 
 static char    g_jsonBuf[JSON_SIZE];
 
@@ -70,31 +70,31 @@ volatile RobotState state = STATE_IDLE;
 
 const uint32_t BROADCAST_MIN_INTERVAL_MS  = 100;
 const uint32_t BROADCAST_MAX_INTERVAL_MS  = 100;
-const uint32_t PEER_LINK_DROP_MS = 900;
+const uint32_t PEER_LINK_DROP_MS          = 900;
 const uint32_t WIFI_RECONNECT_INTERVAL_MS = 300;
-const uint32_t WIFI_TIMEOUT_MS = 10000;
-const uint32_t WIFI_RETRY_DELAY_MS = 200;
+const uint32_t WIFI_TIMEOUT_MS            = 10000;
+const uint32_t WIFI_RETRY_DELAY_MS        = 200;
 const uint32_t TCP_MONITORING_INTERVAL_MS = 100;
 const uint32_t MEMORY_CLEANUP_INTERVAL_MS = 5000;
 const uint32_t STATS_PRINT_INTERVAL_MS    = 5000;
-const uint32_t SERIAL_STABILIZE_DELAY_MS = 1000;
+const uint32_t SERIAL_STABILIZE_DELAY_MS  = 1000;
 
-static const int ESPNOW_MAX_PAYLOAD = 1470;
+static const int ESPNOW_MAX_PAYLOAD       = 1470;
 
-uint32_t currentBroadcastInterval_ms = BROADCAST_MIN_INTERVAL_MS;
-static uint8_t g_pkt[ESPNOW_MAX_PAYLOAD];
+uint32_t currentBroadcastInterval_ms      = BROADCAST_MIN_INTERVAL_MS;
 const uint32_t Peer_LinkDrop_MS           = 900;
+static uint8_t g_pkt[ESPNOW_MAX_PAYLOAD];
 
 
 // 펄스/제어 상수
 static const float PULSES_PER_MM     = 18.0f;
 static const float PULSES_PER_DEGREE = 12.8f;
-static const int   FWD_SPD  = 100;
-static const int   TURN_SPD = 100;
+static const int   FWD_SPD           = 100;
+static const int   TURN_SPD          = 100;
 
 // 900펄스마다 새로운 명령을 받음
 static const long  UPDATE_THRESHOLD_PULSES = 900;   
-static const float MIN_DIST_MM               = 40.0f; 
+static const float MIN_DIST_MM             = 40.0f; 
 
 // IR/회피
 static const int TH        = 80;
@@ -110,21 +110,20 @@ static const float ROTATION_DEADBAND_DEG = 5.0f;    // 미세 회전 무시 각�
 static const int   MIN_MOTOR_PWM         = 60;      // 모터 구동 최소 출력
 
 // PI 제어 게인 (주행 보정)
-static const float K_P = 0.5f;
-static const float K_I = 0.002f;
+static const float K_P            = 0.5f;
+static const float K_I            = 0.002f;
 static const float INTEGRAL_LIMIT = 500.0f;
 static const int   ERROR_DEADBAND = 5;
 
 // 비상 동작 속도
 static const int EMERGENCY_SPIN_SPD = 200;
+static const uint16_t ESCAPING_MS   = 1000;
+unsigned long escaping_until_ms     = 0;
 
-static const uint16_t ESCAPING_MS = 1000;
-unsigned long escaping_until_ms = 0;
-
-static const unsigned long EMERGENCY_SPIN_MS = 1200;
-static const unsigned long BACK_MS           = 120;
+static const unsigned long EMERGENCY_SPIN_MS     = 1200;
+static const unsigned long BACK_MS               = 120;
 static const unsigned long OSCILLATION_WINDOW_MS = 1200;
-static const int   OSCILLATION_COUNT_THRESHOLD = 4;
+static const int   OSCILLATION_COUNT_THRESHOLD   = 4;
 
 int last_turn_direction = 0;         
 int turn_change_count   = 0;
@@ -139,11 +138,11 @@ volatile long right_encoder_count = 0;
 void IRAM_ATTR isr_left_encoder()  { left_encoder_count++; }
 void IRAM_ATTR isr_right_encoder() { right_encoder_count++; }
 
-static long  start_left_count  = 0;
-static long  start_right_count = 0;
+static long  start_left_count   = 0;
+static long  start_right_count  = 0;
 static long  target_turn_pulses = 0;
 static long  target_move_pulses = 0;
-static float integral_error = 0.0f;
+static float integral_error     = 0.0f;
 
 // --- 제어 주기 ---
 static const unsigned long CONTROL_INTERVAL_MS    = 5;    // 5ms 이동 제어
@@ -195,7 +194,7 @@ void ensureBroadcastPeer() {
 
   esp_now_peer_info_t p = {};
   memcpy(p.peer_addr, bcast, 6);
-  p.ifidx = WIFI_IF_STA;
+  p.ifidx   = WIFI_IF_STA;
   p.channel = WiFi.channel();
   p.encrypt = false;
 
@@ -363,18 +362,16 @@ void update_status_led() {
 }
 
 void start_motion(float angle_deg, float dist_mm) {
-  if (state == STATE_AVOID || state == STATE_ESCAPING || state == STATE_EMERGENCY) {
-    return;
-  }
+  if (state == STATE_AVOID || state == STATE_ESCAPING || state == STATE_EMERGENCY) return;
 
   start_left_count  = left_encoder_count;
   start_right_count = right_encoder_count;
-  integral_error = 0.0f;
+  integral_error    = 0.0f;
 
   target_turn_pulses = (long)lroundf(fabsf(angle_deg) * PULSES_PER_DEGREE);
   target_move_pulses = (long)lroundf(fabsf(dist_mm)  * PULSES_PER_MM);
 
-  if (target_turn_pulses > 0 && fabsf(angle_deg) > (ROTATION_DEADBAND_DEG)) {
+  if (target_turn_pulses > 0 && fabsf(angle_deg) > ROTATION_DEADBAND_DEG) {
     state = STATE_TURNING;
     if (angle_deg > 0) Motors_spin_right(TURN_SPD);
     else                Motors_spin_left(TURN_SPD);
@@ -420,25 +417,15 @@ void control_loop(int r1, int r2, int r3, int r4, int r5) {
 
   if (obstacle) {
     if (state != STATE_AVOID && state != STATE_ESCAPING && state != STATE_EMERGENCY) {
-      Motors_stop();
-      clear_motion_targets();
-      state = STATE_AVOID;
+      Motors_stop(); clear_motion_targets(); state = STATE_AVOID;
     }
   }
 
   if (state == STATE_EMERGENCY) {
     unsigned long now = millis();
-    if (now < emergency_back_until) {
-      Motors_backward(FWD_SPD);
-      return;
-    }
-    if (now < emergency_spin_until) {
-      Motors_spin_left(EMERGENCY_SPIN_SPD);
-      return;
-    }
-    Motors_stop();
-    state = STATE_IDLE;
-    return;
+    if (now < emergency_back_until) { Motors_backward(FWD_SPD); return; }
+    if (now < emergency_spin_until) { Motors_spin_left(EMERGENCY_SPIN_SPD); return; }
+    Motors_stop(); state = STATE_IDLE; return;
   }
 
   long l_now = labs(left_encoder_count - start_left_count);
@@ -452,18 +439,15 @@ void control_loop(int r1, int r2, int r3, int r4, int r5) {
         if (target_move_pulses > 0) {
           start_left_count  = left_encoder_count;
           start_right_count = right_encoder_count;
-          integral_error = 0.0f;
+          integral_error    = 0.0f;
           state = STATE_MOVING;
-        } else {
-          state = STATE_IDLE;
-        }
+        } else { state = STATE_IDLE; }
       }
       break;
 
     case STATE_MOVING:
       if (avg >= target_move_pulses) {
-        Motors_stop();
-        state = STATE_IDLE;
+        Motors_stop(); state = STATE_IDLE;
       } else {
         int lp, rp;
         pi_control(l_now, r_now, &lp, &rp);
@@ -473,37 +457,25 @@ void control_loop(int r1, int r2, int r3, int r4, int r5) {
       break;
 
     case STATE_AVOID:
-      if ((r1 <= TH_OUTER) && (r2 <= TH) && (r3 <= TH) && (r4 <= TH) && (r5 <= TH_OUTER)) {
-        enter_escaping(ESCAPING_MS);
-        break;
+      if ((r1<=TH_OUTER)&&(r2<=TH)&&(r3<=TH)&&(r4<=TH)&&(r5<=TH_OUTER)) {
+        enter_escaping(ESCAPING_MS); break;
       }
       if (r3 >= TH) {
         if (abs(r2 - r4) <= DELTA || r2 < r4) {
-          Motors_spin_left(TURN_SPD);
-          check_oscillation_and_escape(-1);
+          Motors_spin_left(TURN_SPD);  check_oscillation_and_escape(-1);
         } else {
-          Motors_spin_right(TURN_SPD);
-          check_oscillation_and_escape(+1);
+          Motors_spin_right(TURN_SPD); check_oscillation_and_escape(+1);
         }
       } else if (r1 >= TH_OUTER || r2 >= TH) {
-        Motors_spin_right(TURN_SPD);
-        check_oscillation_and_escape(+1);
+        Motors_spin_right(TURN_SPD); check_oscillation_and_escape(+1);
       } else if (r4 >= TH || r5 >= TH_OUTER) {
-        Motors_spin_left(TURN_SPD);
-        check_oscillation_and_escape(-1);
+        Motors_spin_left(TURN_SPD); check_oscillation_and_escape(-1);
       }
       break;
 
     case STATE_ESCAPING:
-      if (obstacle) {
-        Motors_stop();
-        state = STATE_AVOID;
-        break;
-      }
-      if ((int32_t)(millis() - escaping_until_ms) >= 0) {
-        Motors_stop();
-        state = STATE_IDLE;
-      }
+      if (obstacle) { Motors_stop(); state = STATE_AVOID; break; }
+      if ((int32_t)(millis() - escaping_until_ms) >= 0) { Motors_stop(); state = STATE_IDLE; }
       break;
 
     default: break;
@@ -546,53 +518,48 @@ void puppetTask(void* parameter) {
   }
 }
 
+// ============================================================
+// ====== 공통 초기화 =========================================
+// ============================================================
 void setupNetwork() {
   WiFi.mode(WIFI_STA);
-
-  // 절전/모뎀슬립 비활성화 + 자동 재연결
   WiFi.setSleep(false);
   esp_wifi_set_ps(WIFI_PS_NONE);
   WiFi.setAutoReconnect(true);
   WiFi.persistent(true);
-
   WiFi.begin(SSID, PASSWORD);
 
-  Serial.print("[WiFi] Connecting to AP");
+  Serial.print("[WiFi] Connecting");
   unsigned long t0 = millis();
   while (WiFi.status() != WL_CONNECTED) {
-    delay(WIFI_RECONNECT_INTERVAL_MS);
-    Serial.print(".");
-    if (millis() - t0 > (WIFI_TIMEOUT_MS)) {
-      Serial.println("\n[WiFi] connect timeout -> retry");
+    delay(WIFI_RECONNECT_INTERVAL_MS); Serial.print(".");
+    if (millis() - t0 > WIFI_TIMEOUT_MS) {
+      Serial.println("\n[WiFi] Timeout, retrying...");
       WiFi.disconnect(true, true);
       delay(WIFI_RETRY_DELAY_MS);
       WiFi.begin(SSID, PASSWORD);
-      t0 = millis();
-      Serial.print("[WiFi] Connecting to AP");
+      t0 = millis(); Serial.print("[WiFi] Connecting");
     }
   }
   Serial.printf("\n[WiFi] Connected: %s\n", WiFi.localIP().toString().c_str());
   Serial.printf("[WiFi] SELF_ID: %s\n", SELF_ID.c_str());
 
-  // 실제 채널 출력 (ESPNOW는 이 채널과 동일해야 함)
   uint8_t primary = 0;
   wifi_second_chan_t second = WIFI_SECOND_CHAN_NONE;
   esp_wifi_get_channel(&primary, &second);
   Serial.printf("[WiFi] Channel: %d\n", primary);
 
-  // Start TCP server
+  // TCP 서버 시작 (P2P용)
   tcpServer.begin();
-  Serial.printf("[TCP] Server on port %d\n", TCP_PORT);
+  Serial.printf("[P2P][Core1] TCP server started on port %d\n", TCP_PORT);
 
+  // ESP-NOW 초기화 (P2P용)
   if (esp_now_init() != ESP_OK) {
-    Serial.println("[ESPNOW] init failed -> restart");
-    ESP.restart();
+    Serial.println("[ESPNOW] Init failed -> restart"); ESP.restart();
   }
   esp_now_register_recv_cb(onEspNowRecv);
-
   ensureBroadcastPeer();
-
-  Serial.printf("[ESPNOW] Ready. Using max payload=%d (v2 confirmed in your environment)\n", ESPNOW_MAX_PAYLOAD);
+  Serial.printf("[ESPNOW] Ready. Max payload=%d bytes\n", ESPNOW_MAX_PAYLOAD);
 }
 
 void setup() {
@@ -614,18 +581,17 @@ void setup() {
 
   // MONA 하드웨어 초기화 (Puppet용)
   Mona_ESP_init();
-
-  // Setup encoders
-  pinMode(PIN_ENCODER_LEFT, INPUT);
+  pinMode(PIN_ENCODER_LEFT,  INPUT);
   pinMode(PIN_ENCODER_RIGHT, INPUT);
-  attachInterrupt(digitalPinToInterrupt(PIN_ENCODER_LEFT), isr_left_encoder, RISING);
+  attachInterrupt(digitalPinToInterrupt(PIN_ENCODER_LEFT),  isr_left_encoder,  RISING);
   attachInterrupt(digitalPinToInterrupt(PIN_ENCODER_RIGHT), isr_right_encoder, RISING);
   Set_LED(1, 0, 30, 0);
   Set_LED(2, 0, 30, 0);
 
+  // WiFi + TCP + ESP-NOW 초기화
   setupNetwork();
 
-// ====== Core 1: puppet loop() ==================================
+  // ★ Core 0에 Puppet 태스크 생성
   xTaskCreatePinnedToCore(
     puppetTask,        // 태스크 함수
     "PuppetTask",      // 태스크 이름
@@ -641,7 +607,10 @@ void setup() {
   Serial.println("[SYSTEM]   Core 1 → P2P   (ESP-NOW + TCP CBBA)");
 }
 
+
+// ============================================================
 // ====== Core 1: P2P loop() ==================================
+// ============================================================
 void loop() {
   unsigned long loopStart_us = micros();
 
